@@ -51,6 +51,7 @@ def main() -> int:
         )
         inventory = gguf_inventory(output, binaries["converter"].parent)
         model.validate_quant_overrides(inventory, spec)
+        model.assert_text_only_gguf(inventory)
         smoke_load(
             binaries["llama-cli"],
             output,
@@ -62,6 +63,12 @@ def main() -> int:
             {
                 "name": name,
                 "base_type": spec["base_type"],
+                "embedding_type": spec.get("embedding_type"),
+                "output_type": spec.get("output_type"),
+                "ple_type": spec.get("ple_type"),
+                "ple_proj_type": spec.get("ple_proj_type"),
+                "attention_type": spec.get("attention_type"),
+                "pure": spec.get("pure", False),
                 "imatrix_sha256": sha256_file(imatrix_path()),
                 "reference_sha256": sha256_file(reference_path()),
                 **{key: value for key, value in inventory.items() if key != "tensors"},

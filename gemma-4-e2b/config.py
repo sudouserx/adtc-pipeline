@@ -13,6 +13,7 @@ _LOCAL_DATA = os.environ.get("KUZA_LOCAL_DATA", "").strip()
 LOCAL_DATA_DIR = Path(_LOCAL_DATA) if _LOCAL_DATA else None
 
 RUN_ID = "kuza-gemma-4-e2b"
+UPLOAD_REPO = os.environ.get("KUZA_UPLOAD_REPO", "kuzaai/kuza-gemma-4-e2b")
 
 SEED = 42
 MAX_SEQ_LENGTH = 1024
@@ -26,6 +27,11 @@ MAX_TRUNCATED_FRACTION = 0.10
 CALIBRATION_PER_LANGUAGE = 400
 CALIBRATION_GENERIC = 200
 EVAL_PER_LANGUAGE = 100
+
+# Runtime flags for llama-cli / llama-bench. Not baked into the GGUF.
+FLASH_ATTN = "on"
+CACHE_TYPE_K = "q8_0"
+CACHE_TYPE_V = "q8_0"
 
 CUDA_ARCH: str | None = None
 

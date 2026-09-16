@@ -50,5 +50,10 @@ python 02_sft.py
 python 03_reference.py
 python 04_imatrix.py
 python 05_quants.py
-python 06_screen.py
+python 06_screen.py  # hidden-set rank; KLD diagnostic; GPU TPS is not ADTC
 python 07_provenance.py
+if [ "${KUZA_SKIP_UPLOAD:-}" = "1" ]; then
+  echo "upload: skipped (KUZA_SKIP_UPLOAD=1)"
+else
+  python 08_upload.py
+fi

@@ -94,21 +94,39 @@ SHARED_KV_KEY = re.compile(
     r"\.layers\.(1[5-9]|2[0-9]|3[0-4])\.self_attn\.(k_proj|v_proj|k_norm)(?:\.|$)"
 )
 
+# Default production recipe is MixCal imatrix Q4_K without embedding/attn
+# upcasts. Higher bit-width than the Gemma 4 QAT lattice (Q8_0 emb, Q6_K
+# attn, BF16 PLE proj) inflates size and can raise KLD. q4_0 is a control.
 QUANT_CANDIDATES = {
-    "q4_k_m_control": {
+    "q4_k_m_ud_style": {
         "base_type": "q4_k_m",
-        "filename": "kuza-q4_k_m-control.gguf",
-        "preserve_attention_q6": True,
+        "filename": "kuza-q4_k_m-ud-style.gguf",
+        "embedding_type": "q4_k",
+        "output_type": "q4_k",
+        "ple_type": "q4_k",
+        "ple_proj_type": "q4_k",
+        "attention_type": None,
+        "pure": False,
+    },
+    "ud_q4_k_xl": {
+        "base_type": "q4_k_m",
+        "filename": "kuza-ud-q4_k_xl.gguf",
+        "embedding_type": "q5_k",
+        "output_type": "q5_k",
+        "ple_type": "q4_k",
+        "ple_proj_type": "q5_k",
+        "attention_type": "q5_k",
+        "pure": False,
     },
     "q4_0_qat_aligned": {
         "base_type": "q4_0",
         "filename": "kuza-q4_0-qat-aligned.gguf",
-        "preserve_attention_q6": True,
-    },
-    "q4_k_m_ud_style": {
-        "base_type": "q4_k_m",
-        "filename": "kuza-q4_k_m-ud-style.gguf",
-        "preserve_attention_q6": False,
+        "embedding_type": None,
+        "output_type": None,
+        "ple_type": None,
+        "ple_proj_type": None,
+        "attention_type": None,
+        "pure": True,
     },
 }
 
@@ -126,6 +144,17 @@ DOSAGE_PATTERN = re.compile(
 )
 
 
+def _apply_chat_template(tokenizer: Any, messages: list[dict[str, str]], **kwargs: Any) -> str:
+    try:
+        return tokenizer.apply_chat_template(
+            messages,
+            chat_template_kwargs={"enable_thinking": False},
+            **kwargs,
+        )
+    except TypeError:
+        return tokenizer.apply_chat_template(messages, **kwargs)
+
+
 def patch_chat_template(tokenizer: Any) -> None:
     """Inject the Kuza system prompt when the caller omits a system turn."""
     marker = "KUZA_CANONICAL_SYSTEM_PROMPT"
@@ -135,6 +164,7 @@ def patch_chat_template(tokenizer: Any) -> None:
     if marker not in template:
         fallback = (
             "{# " + marker + " #}\n"
+            "{%- set enable_thinking = false -%}\n"
             "{%- if messages and messages[0]['role'] != 'system' and "
             "messages[0]['role'] != 'developer' -%}\n"
             "{%- set messages = [{'role': 'system', 'content': "
@@ -143,13 +173,17 @@ def patch_chat_template(tokenizer: Any) -> None:
             "{%- endif -%}\n"
         )
         tokenizer.chat_template = fallback + template
+    if hasattr(tokenizer, "enable_thinking"):
+        tokenizer.enable_thinking = False
     for user_text in ("How should I space maize?", "Nipande mahindi kwa nafasi gani?"):
-        implicit = tokenizer.apply_chat_template(
+        implicit = _apply_chat_template(
+            tokenizer,
             [{"role": "user", "content": user_text}],
             tokenize=False,
             add_generation_prompt=True,
         )
-        explicit = tokenizer.apply_chat_template(
+        explicit = _apply_chat_template(
+            tokenizer,
             [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_text},
@@ -195,7 +229,8 @@ def dialog_messages(row: dict[str, Any]) -> list[dict[str, str]]:
 
 
 def render_text(tokenizer: Any, row: dict[str, str]) -> str:
-    rendered = tokenizer.apply_chat_template(
+    rendered = _apply_chat_template(
+        tokenizer,
         [{"role": "system", "content": SYSTEM_PROMPT}, *dialog_messages(row)],
         tokenize=False,
         add_generation_prompt=False,
@@ -205,7 +240,8 @@ def render_text(tokenizer: Any, row: dict[str, str]) -> str:
 
 
 def render_generation_prompt(tokenizer: Any, prompt: str) -> str:
-    rendered = tokenizer.apply_chat_template(
+    rendered = _apply_chat_template(
+        tokenizer,
         [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
@@ -332,6 +368,20 @@ def first_matching_tensors(
     raise RuntimeError(f"No GGUF tensors matched required {family} family")
 
 
+def _normalized_quant_spec(spec: dict[str, Any] | str) -> dict[str, Any]:
+    if isinstance(spec, str):
+        return {
+            "base_type": spec,
+            "embedding_type": None,
+            "output_type": None,
+            "ple_type": None,
+            "ple_proj_type": None,
+            "attention_type": None,
+            "pure": spec == "q4_0",
+        }
+    return spec
+
+
 def quant_command(
     binary: Any,
     reference: Any,
@@ -339,60 +389,75 @@ def quant_command(
     imatrix: Any,
     spec: dict[str, Any] | str,
 ) -> list[Any]:
-    if isinstance(spec, str):
-        spec = {"base_type": spec, "preserve_attention_q6": spec != "q4_0"}
+    spec = _normalized_quant_spec(spec)
     base_type = str(spec["base_type"])
     bulk_type = "q4_0" if base_type == "q4_0" else "q4_k"
-    command = [
-        binary,
-        "--imatrix",
-        imatrix,
-        *(("--pure",) if base_type == "q4_0" else ()),
-        "--token-embedding-type",
-        "q8_0",
-        "--output-tensor-type",
-        "q8_0",
-        "--tensor-type",
-        r"per_layer_token_embd\.weight=q6_k",
-        "--tensor-type",
-        r"per_layer_model_proj\.weight=bf16",
-    ]
-    if spec.get("preserve_attention_q6", True):
+    command: list[Any] = [binary, "--imatrix", imatrix]
+    if spec.get("pure") or base_type == "q4_0":
+        command.append("--pure")
+    if spec.get("embedding_type"):
+        command.extend(["--token-embedding-type", str(spec["embedding_type"])])
+    if spec.get("output_type"):
+        command.extend(["--output-tensor-type", str(spec["output_type"])])
+    if spec.get("ple_type"):
+        command.extend(
+            ["--tensor-type", rf"per_layer_token_embd\.weight={spec['ple_type']}"]
+        )
+    if spec.get("ple_proj_type"):
+        command.extend(
+            ["--tensor-type", rf"per_layer_model_proj\.weight={spec['ple_proj_type']}"]
+        )
+    if spec.get("attention_type"):
         command.extend(
             [
                 "--tensor-type",
-                r"blk\..*\.attn_(q|k|v|output|qkv)\.weight=q6_k",
+                rf"blk\..*\.attn_(q|k|v|output|qkv)\.weight={spec['attention_type']}",
             ]
         )
-    command.extend(
-        [
-            "--tensor-type",
-            rf"blk\..*\.ffn_gate\.weight={bulk_type}",
-            "--tensor-type",
-            rf"blk\..*\.ffn_up\.weight={bulk_type}",
-            "--tensor-type",
-            rf"blk\..*\.ffn_down\.weight={bulk_type}",
-            reference,
-            output,
-            base_type,
-        ]
-    )
+    if not spec.get("pure"):
+        command.extend(
+            [
+                "--tensor-type",
+                rf"blk\..*\.ffn_gate\.weight={bulk_type}",
+                "--tensor-type",
+                rf"blk\..*\.ffn_up\.weight={bulk_type}",
+                "--tensor-type",
+                rf"blk\..*\.ffn_down\.weight={bulk_type}",
+            ]
+        )
+    command.extend([reference, output, base_type])
     return command
+
+
+def _gguf_type_name(value: str) -> str:
+    return value.upper().replace(".", "_")
 
 
 def validate_quant_overrides(
     inventory: dict[str, Any],
     spec: dict[str, Any] | str,
 ) -> None:
-    if isinstance(spec, str):
-        spec = {"base_type": spec, "preserve_attention_q6": True}
+    spec = _normalized_quant_spec(spec)
     base_type = str(spec["base_type"])
     tensors = inventory["tensors"]
-    families = [
-        ("per_layer_token_embd", [r"per_layer_token_embd\.weight$"], "Q6_K"),
-        ("per_layer_model_proj", [r"per_layer_model_proj\.weight$"], "BF16"),
-    ]
-    if spec.get("preserve_attention_q6", True):
+    families: list[tuple[str, list[str], str]] = []
+    if spec.get("ple_type"):
+        families.append(
+            (
+                "per_layer_token_embd",
+                [r"per_layer_token_embd\.weight$"],
+                _gguf_type_name(str(spec["ple_type"])),
+            )
+        )
+    if spec.get("ple_proj_type"):
+        families.append(
+            (
+                "per_layer_model_proj",
+                [r"per_layer_model_proj\.weight$"],
+                _gguf_type_name(str(spec["ple_proj_type"])),
+            )
+        )
+    if spec.get("attention_type"):
         families.append(
             (
                 "attention",
@@ -400,13 +465,15 @@ def validate_quant_overrides(
                     r"blk\..*\.attn_(q|k|v|output)\.weight$",
                     r"blk\..*\.attn_qkv\.weight$",
                 ],
-                "Q6_K",
+                _gguf_type_name(str(spec["attention_type"])),
             )
         )
     for family, patterns, expected in families:
         matched = first_matching_tensors(tensors, patterns, family)
         wrong = {
-            name: dtype for name, dtype in matched.items() if dtype.upper() != expected
+            name: dtype
+            for name, dtype in matched.items()
+            if _gguf_type_name(dtype) != expected
         }
         if wrong:
             raise RuntimeError(
@@ -420,10 +487,18 @@ def validate_quant_overrides(
     if not embedding_names:
         raise RuntimeError("No token embedding or output tensors were found")
     for name in embedding_names:
-        if tensors[name].upper() != "Q8_0":
-            raise RuntimeError(f"{name} should be Q8_0, found {tensors[name]}")
+        if name in {"output.weight", "output"} and spec.get("output_type"):
+            wanted = _gguf_type_name(str(spec["output_type"]))
+        elif spec.get("embedding_type"):
+            wanted = _gguf_type_name(str(spec["embedding_type"]))
+        elif spec.get("pure") or base_type == "q4_0":
+            wanted = "Q4_0"
+        else:
+            continue
+        if _gguf_type_name(tensors[name]) != wanted:
+            raise RuntimeError(f"{name} should be {wanted}, found {tensors[name]}")
     bulk = {
-        name: dtype.upper()
+        name: _gguf_type_name(dtype)
         for name, dtype in tensors.items()
         if re.search(r"blk\..*\.ffn_(?:gate|up|down)\.weight$", name)
     }
@@ -437,6 +512,36 @@ def validate_quant_overrides(
         raise RuntimeError(
             f"Unexpected {base_type} bulk tensor types: {dict(list(wrong_bulk.items())[:20])}"
         )
+
+
+def multimodal_tensor_names(tensors: dict[str, str]) -> list[str]:
+    leaked: list[str] = []
+    for name in tensors:
+        lower = name.lower()
+        if name.startswith(("v.", "a.", "audio.", "vision.")) or "mmproj" in lower:
+            leaked.append(name)
+    return leaked
+
+
+def assert_text_only_gguf(inventory: dict[str, Any]) -> None:
+    leaked = multimodal_tensor_names(inventory["tensors"])
+    if leaked:
+        raise RuntimeError(
+            "GGUF is not text-only; multimodal tensors leaked: "
+            f"{leaked[:20]}"
+        )
+    if not any("per_layer_token_embd" in name for name in inventory["tensors"]):
+        raise RuntimeError(
+            "Text GGUF dropped per-layer embeddings; PLE must be kept"
+        )
+
+
+def mtp_tensor_names(tensors: dict[str, str]) -> list[str]:
+    return [
+        name
+        for name in tensors
+        if re.search(r"(?:^|[._])(?:mtp|draft|nextn)(?:[._]|$)", name, re.I)
+    ]
 
 
 def smoke_warnings(prompt_name: str, output: str) -> list[str]:

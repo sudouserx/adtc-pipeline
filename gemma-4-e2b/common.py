@@ -631,8 +631,10 @@ def prepare_sft_data(
             text = model.render_text(tokenizer, row)
             full_ids = tokenizer(text, add_special_tokens=False)["input_ids"]
             is_truncated = len(full_ids) > config.MAX_SEQ_LENGTH
+            # keep_start: never left-slice. A tail crop drops the system/user
+            # turn and can still match RESPONSE_PART on the assistant answer.
             limited_ids = (
-                full_ids[-config.MAX_SEQ_LENGTH :] if is_truncated else full_ids
+                full_ids[: config.MAX_SEQ_LENGTH] if is_truncated else full_ids
             )
             has_response = contains_subsequence(limited_ids, marker_ids)
             if is_truncated:
@@ -810,26 +812,34 @@ def gguf_inventory(path: Path, llama_cpp_root: Path) -> dict[str, Any]:
 
 
 def smoke_load(binary: Path, weights: Path, prompt: str, log_path: Path) -> str:
-    return run(
-        [
-            binary,
-            "-m",
-            weights,
-            "-p",
-            prompt,
-            "-n",
-            "24",
-            "-c",
-            str(config.MAX_SEQ_LENGTH),
-            "-ngl",
-            "999",
-            "--temp",
-            "0",
-            "--no-display-prompt",
-        ],
-        capture=True,
-        log_path=log_path,
-    )
+    command = [
+        binary,
+        "-m",
+        weights,
+        "-p",
+        prompt,
+        "-n",
+        "24",
+        "-c",
+        str(config.MAX_SEQ_LENGTH),
+        "-ngl",
+        "999",
+        "--temp",
+        "0",
+        "--no-display-prompt",
+        "--chat-template-kwargs",
+        '{"enable_thinking":false}',
+        "-fa",
+        str(getattr(config, "FLASH_ATTN", "on")),
+        "-ctk",
+        str(getattr(config, "CACHE_TYPE_K", "q8_0")),
+        "-ctv",
+        str(getattr(config, "CACHE_TYPE_V", "q8_0")),
+    ]
+    extra = getattr(config, "SMOKE_EXTRA_ARGS", ())
+    if extra:
+        command.extend(str(part) for part in extra)
+    return run(command, capture=True, log_path=log_path)
 
 
 REQUIRED_SFT_CONFIG_KEYS = (
@@ -955,6 +965,7 @@ def render_corpus(
 ) -> dict[str, Any]:
     rendered_rows: list[str] = []
     truncated = 0
+    total_tokens = 0
     for row in rows:
         text = model.render_text(tokenizer, row)
         ids = tokenizer(text, add_special_tokens=False)["input_ids"]
@@ -962,15 +973,35 @@ def render_corpus(
             ids = ids[:max_seq_length]
             text = tokenizer.decode(ids, skip_special_tokens=False)
             truncated += 1
+        total_tokens += len(ids)
         rendered_rows.append(text)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text("\n\n".join(rendered_rows) + "\n", encoding="utf-8")
     return {
         "rows": len(rendered_rows),
         "truncated": truncated,
+        "tokens": total_tokens,
         "sha256": sha256_file(output),
         "size": output.stat().st_size,
     }
+
+
+def tool_help(binary: Path) -> str:
+    last = ""
+    for flag in ("-h", "--help"):
+        try:
+            return run([binary, flag], capture=True)
+        except RuntimeError as exc:
+            last = str(exc)
+    return last
+
+
+def help_has(help_text: str, flag: str) -> bool:
+    return re.search(rf"(?:^|\s){re.escape(flag)}(?:\s|,|$)", help_text) is not None
+
+
+def generation_tps(bench_values: Sequence[float]) -> float:
+    return float(bench_values[-1]) if bench_values else 0.0
 
 
 def parse_mean_kld(output: str) -> float | None:

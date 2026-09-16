@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import math
+
 import config
 import model
 from common import (
@@ -62,6 +64,11 @@ def main() -> int:
     eval_stats = render_corpus(
         tokenizer, eval_rows, evaluation, config.MAX_SEQ_LENGTH
     )
+    calib_tokens = int(calib_stats.get("tokens") or 0)
+    chunks = max(
+        1,
+        math.ceil(calib_tokens / config.MAX_SEQ_LENGTH) + 8 if calib_tokens else 1024,
+    )
     run(
         [
             binaries["llama-imatrix"],
@@ -78,7 +85,7 @@ def main() -> int:
             "-b",
             "512",
             "--chunks",
-            "200",
+            str(chunks),
             "-t",
             "4",
         ],
@@ -96,6 +103,7 @@ def main() -> int:
                 calibration_ids
                 & {(row["source"], row["source_id"]) for row in eval_rows}
             ),
+            "imatrix_chunks": chunks,
         },
     )
     print(f"imatrix: {dest}")
