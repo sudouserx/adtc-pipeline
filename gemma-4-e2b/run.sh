@@ -16,6 +16,14 @@ if not os.environ.get("HF_TOKEN"):
     sys.exit("HF_TOKEN must be set")
 if shutil.which("nvidia-smi") is None:
     sys.exit("nvidia-smi not found; a CUDA GPU is required")
+missing = [name for name in ("cmake", "g++", "make", "nvcc") if shutil.which(name) is None]
+if missing:
+    sys.exit(
+        "llama.cpp build tools missing: "
+        + ", ".join(missing)
+        + ". Install them, then resume from 01_setup_llama_cpp.py: "
+        "apt-get update && apt-get install -y cmake g++ make git"
+    )
 
 for key, repo in model.DATASETS.items():
     print(f"preflight: {key} <- {repo}")

@@ -6,10 +6,17 @@ from __future__ import annotations
 import sys
 
 import config
-from common import package_version, public_version, pytorch_index_url, run
+from common import (
+    package_version,
+    public_version,
+    pytorch_index_url,
+    require_llama_cpp_build_tools,
+    run,
+)
 
 
 def main() -> int:
+    require_llama_cpp_build_tools()
     mismatches = {
         name: (package_version(name), version)
         for name, version in config.PINNED_PACKAGES.items()

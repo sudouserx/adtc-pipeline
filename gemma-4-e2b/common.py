@@ -235,6 +235,22 @@ def seed_everything(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
+def require_llama_cpp_build_tools() -> None:
+    missing = [
+        name for name in ("cmake", "g++", "make") if shutil.which(name) is None
+    ]
+    if shutil.which("nvcc") is None:
+        missing.append("nvcc")
+    if missing:
+        raise RuntimeError(
+            "llama.cpp build tools missing: "
+            + ", ".join(missing)
+            + ". Install them, then resume from 01_setup_llama_cpp.py:\n"
+            "  apt-get update && apt-get install -y cmake g++ make git\n"
+            "  python 01_setup_llama_cpp.py"
+        )
+
+
 def detect_cuda_arch() -> str:
     if config.CUDA_ARCH:
         return str(config.CUDA_ARCH)
@@ -286,6 +302,7 @@ def setup_llama_cpp() -> dict[str, Path]:
         actual = run(["git", "rev-parse", "HEAD"], cwd=checkout, capture=True).strip()
         if actual == config.LLAMA_CPP_COMMIT:
             return binaries
+    require_llama_cpp_build_tools()
     if not checkout.exists():
         run(["git", "clone", "https://github.com/ggml-org/llama.cpp.git", checkout])
     run(["git", "fetch", "origin", config.LLAMA_CPP_COMMIT], cwd=checkout)
