@@ -76,12 +76,21 @@ def read_jsonl(path: Path) -> list[dict]:
     ]
 
 
+def llama_help(llama_cli: Path) -> str:
+    result = subprocess.run(
+        [str(llama_cli), "-h"], capture_output=True, text=True, check=False
+    )
+    return f"{result.stdout or ''}{result.stderr or ''}"
+
+
 def generate(
     llama_cli: Path,
     gguf: Path,
     prompt: str,
     n_predict: int,
     ngl: int,
+    *,
+    cli_help: str = "",
 ) -> str:
     command = [
         str(llama_cli),
@@ -104,7 +113,15 @@ def generate(
         "--no-display-prompt",
         "--chat-template-kwargs",
         '{"enable_thinking":false}',
+        "-fa",
+        "on",
+        "-ctk",
+        "q8_0",
+        "-ctv",
+        "q8_0",
     ]
+    if re.search(r"(?:^|\s)--reasoning(?:\s|,|$)", cli_help):
+        command.extend(["--reasoning", "off"])
     result = subprocess.run(command, capture_output=True, text=True, check=False)
     if result.returncode:
         return f"[ERROR {result.returncode}] {(result.stderr or result.stdout)[:400]}"
@@ -172,17 +189,25 @@ def main() -> int:
     parser.add_argument("--ngl", type=int, default=99)
     parser.add_argument("--n-predict", type=int, default=192)
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="Write the JSON report here (default: experiments/results/hidden_<name>.json)",
+    )
     args = parser.parse_args()
     gguf = Path(args.gguf)
     if not gguf.is_file():
         raise SystemExit(f"missing GGUF {gguf}")
     llama_cli = resolve_llama_cli(args.llama_cli)
+    cli_help = llama_help(llama_cli)
     rows = read_jsonl(PROMPTS)
     if args.limit:
         rows = rows[: args.limit]
     scored = []
     for row in rows:
-        output = generate(llama_cli, gguf, row["prompt"], args.n_predict, args.ngl)
+        output = generate(
+            llama_cli, gguf, row["prompt"], args.n_predict, args.ngl, cli_help=cli_help
+        )
         scored.append(score_row(row, output))
         print(f"{row['id']}: {scored[-1]['score']}", flush=True)
     mean = sum(float(item["score"]) for item in scored) / max(1, len(scored))
@@ -195,9 +220,13 @@ def main() -> int:
         "language_failures": sum(1 for item in scored if not item["language_ok"]),
         "rows": scored,
     }
-    dest = ROOT / "experiments" / "results" / f"hidden_{args.name}.json"
+    dest = args.output or (ROOT / "experiments" / "results" / f"hidden_{args.name}.json")
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    shared = ROOT / "experiments" / "results" / f"hidden_{args.name}.json"
+    if shared.resolve() != dest.resolve():
+        shared.parent.mkdir(parents=True, exist_ok=True)
+        shared.write_text(dest.read_text(encoding="utf-8"), encoding="utf-8")
     print(f"mean={report['mean_score']} wrote {dest}")
     return 0
 

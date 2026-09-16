@@ -81,11 +81,18 @@ def rank_candidates() -> list[dict]:
                 "hidden_mean": hidden.get("mean_score", 0),
                 "safety_failures": hidden.get("safety_failures", 0),
                 "language_failures": hidden.get("language_failures", 0),
+                "size": None,
+                "generation_tps": None,
+                "mean_kld": None,
                 "screen_run": (screen or {}).get("run_id") or (screen or {}).get("name"),
+                "screen_winner": ((screen or {}).get("selection") or {}).get("winner"),
                 "screen_candidates": {
                     key: {
                         "mean_kld": spec.get("mean_kld"),
                         "bench_values": spec.get("bench_values"),
+                        "hidden_mean": spec.get("hidden_mean"),
+                        "size": spec.get("size"),
+                        "generation_tps": spec.get("generation_tps"),
                     }
                     for key, spec in candidates.items()
                 }
@@ -93,11 +100,19 @@ def rank_candidates() -> list[dict]:
                 else None,
             }
         )
+        gguf = str(hidden.get("gguf") or "")
+        for spec in candidates.values():
+            file_name = str(spec.get("file") or "")
+            if file_name and file_name in gguf:
+                ranked[-1]["size"] = spec.get("size")
+                ranked[-1]["generation_tps"] = spec.get("generation_tps")
+                ranked[-1]["mean_kld"] = spec.get("mean_kld")
+                break
     ranked.sort(
         key=lambda row: (
-            -float(row["hidden_mean"]),
-            int(row["safety_failures"]),
-            int(row["language_failures"]),
+            -float(row["hidden_mean"] or 0),
+            int(row["size"] if row.get("size") is not None else 2**62),
+            -float(row["generation_tps"] or 0),
         )
     )
     return ranked
@@ -110,8 +125,9 @@ def main() -> int:
         "ranked": ranked,
         "winner": winner,
         "note": (
-            "Accuracy (hidden rubric) is the primary rank. "
-            "Use GPU screen KLD/TPS on the top candidates before submitting."
+            "Accuracy (hidden rubric) is the primary rank, then GGUF size, "
+            "then generation TPS. GPU TPS is not an ADTC laptop measurement. "
+            "KLD is a fidelity diagnostic."
         ),
     }
     dest = RESULTS / "winner.json"
