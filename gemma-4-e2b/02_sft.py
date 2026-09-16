@@ -3,10 +3,11 @@
 
 from __future__ import annotations
 
+import unsloth  # noqa: F401  — patch before transformers/trl/peft
+
 import inspect
 import math
 import os
-import sys
 
 import config
 import model
@@ -30,63 +31,9 @@ from common import (
 )
 
 
-# #region agent log
-def _agent_debug_log(location: str, message: str, data: dict, hypothesis_id: str) -> None:
-    import json
-    import time
-    from pathlib import Path
-
-    rec = {
-        "sessionId": "846a88",
-        "runId": "pre-fix",
-        "hypothesisId": hypothesis_id,
-        "location": location,
-        "message": message,
-        "data": data,
-        "timestamp": int(time.time() * 1000),
-    }
-    line = json.dumps(rec, default=str) + "\n"
-    for path in (
-        Path("/home/ebrahim/Desktop/adtc pipeline/.cursor/debug-846a88.log"),
-        Path(__file__).resolve().parents[1] / ".cursor" / "debug-846a88.log",
-    ):
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("a", encoding="utf-8") as handle:
-                handle.write(line)
-        except Exception:
-            pass
-    print("DEBUG_LOG", line, flush=True)
-
-
-# #endregion
-
-
 def main() -> int:
     hf_token()
     seed_everything(config.SEED)
-    # #region agent log
-    try:
-        import jinja2 as _jinja2
-
-        _agent_debug_log(
-            "02_sft.py:main",
-            "jinja2 before unsloth",
-            {
-                "version": getattr(_jinja2, "__version__", None),
-                "file": getattr(_jinja2, "__file__", None),
-                "unsloth_imported": "unsloth" in sys.modules,
-            },
-            "A",
-        )
-    except Exception as exc:
-        _agent_debug_log(
-            "02_sft.py:main",
-            "jinja2 import failed before unsloth",
-            {"error": type(exc).__name__, "msg": str(exc)},
-            "A",
-        )
-    # #endregion
     base_revision = resolve_base_revision()
     dataset_revisions = resolve_dataset_revisions()
     output_dir = adapter_dir()
@@ -98,22 +45,6 @@ def main() -> int:
     from unsloth import FastModel
     from unsloth.chat_templates import train_on_responses_only
 
-    # #region agent log
-    _agent_debug_log(
-        "02_sft.py:main",
-        "imports after unsloth",
-        {
-            "unsloth_imported": "unsloth" in sys.modules,
-            "unsloth_file": getattr(sys.modules.get("unsloth"), "__file__", None),
-            "import_unsloth_first": list(sys.modules).index("unsloth")
-            < list(sys.modules).index("transformers")
-            if "unsloth" in sys.modules and "transformers" in sys.modules
-            else False,
-        },
-        "D",
-    )
-    # #endregion
-
     loaded, tokenizer = FastModel.from_pretrained(
         model_name=model.BASE_MODEL,
         revision=base_revision,
@@ -123,6 +54,7 @@ def main() -> int:
         load_in_16bit=True,
     )
     tokenizer = model.apply_chat_template(tokenizer)
+    kv_patch = model.patch_kv_sharing(loaded)
     assert_model_bf16(loaded, "Loaded base model")
     checkpoint_keys = checkpoint_weight_keys(model.BASE_MODEL, base_revision)
     model.validate_kv_sharing(loaded, checkpoint_keys)
@@ -247,6 +179,7 @@ def main() -> int:
                 "target_modules": targets,
             },
             "best_checkpoint": trainer.state.best_model_checkpoint,
+            "kv_sharing_patch": kv_patch,
         },
     )
     print(f"adapter: {output_dir}")

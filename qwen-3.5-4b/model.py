@@ -239,6 +239,27 @@ VISION_NAME = re.compile(
 )
 
 
+def is_allowed_fp32_param(name: str, parameter: Any) -> str | None:
+    """SSM A_log/dt_bias, frozen vision, and norms may be FP32. Language linears may not."""
+    if re.search(
+        r"(?:q_proj|k_proj|v_proj|o_proj|qkv_proj|gate_proj|up_proj|down_proj|"
+        r"in_proj_qkvz|in_proj_ba|in_proj_qkv|out_proj|embed_tokens|lm_head)",
+        name,
+    ) and not re.search(r"(?:vision|visual|audio|mmproj|A_log|dt_bias|_fp32_params)", name, re.I):
+        return None
+    if not getattr(parameter, "requires_grad", True):
+        return "frozen"
+    if VISION_NAME.search(name):
+        return "vision"
+    if re.search(r"(?:A_log|dt_bias|_fp32_params)", name):
+        return "ssm"
+    if re.search(r"(?:norm|layernorm|rms)", name, re.I):
+        return "norm"
+    if re.search(r"inv_freq", name, re.I):
+        return "rope"
+    return None
+
+
 def validate_kv_sharing(model: Any, checkpoint_keys: set[str]) -> list[str]:
     return validate_hybrid_layout(model, checkpoint_keys)
 

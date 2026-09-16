@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import unsloth  # noqa: F401  — patch before transformers/trl/peft
+
 import inspect
 import math
 import os

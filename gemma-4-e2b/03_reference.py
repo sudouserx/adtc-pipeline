@@ -14,6 +14,7 @@ from common import (
     adapter_dir,
     assert_adapter_tensors_loaded,
     assert_model_bf16,
+    cast_floating_to_bf16,
     checkpoint_weight_keys,
     gguf_inventory,
     help_has,
@@ -80,6 +81,8 @@ def merge_bf16(base_revision: str, merged: Path) -> dict:
                 continue
             setattr(obj, attr, None)
             dropped_modalities.append(attr)
+    cast_counts = cast_floating_to_bf16(loaded)
+    assert_model_bf16(loaded, "Merged text-only model")
     tokenizer = model.load_tokenizer(adapter_dir())
     merged.mkdir(parents=True, exist_ok=True)
     loaded.save_pretrained(
@@ -106,6 +109,7 @@ def merge_bf16(base_revision: str, merged: Path) -> dict:
     return {
         "dtype_counts": dtype_counts,
         "dropped_modalities": sorted(set(dropped_modalities)),
+        "cast_to_bf16": cast_counts,
         "text_only": True,
     }
 

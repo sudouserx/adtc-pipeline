@@ -725,16 +725,41 @@ def checkpoint_weight_keys(repo_id: str, revision: str) -> set[str]:
 def assert_model_bf16(loaded: Any, label: str) -> None:
     import torch
 
-    counts = Counter(
-        str(parameter.dtype)
-        for parameter in loaded.parameters()
-        if parameter.is_floating_point()
-    )
-    forbidden = {
-        dtype: count for dtype, count in counts.items() if dtype != str(torch.bfloat16)
-    }
+    allowed = getattr(model, "is_allowed_fp32_param", None)
+    forbidden: list[str] = []
+    allowed_families: Counter[str] = Counter()
+    for name, parameter in loaded.named_parameters():
+        if not parameter.is_floating_point() or parameter.dtype == torch.bfloat16:
+            continue
+        family = allowed(name, parameter) if callable(allowed) else None
+        if family:
+            allowed_families[str(family)] += 1
+            continue
+        forbidden.append(f"{name}:{parameter.dtype}")
     if forbidden:
-        raise RuntimeError(f"{label} contains non-BF16 floating weights: {forbidden}")
+        raise RuntimeError(
+            f"{label} contains non-BF16 floating weights: {forbidden[:20]} "
+            f"(allowed_fp32={dict(allowed_families)})"
+        )
+    if allowed_families:
+        print(f"{label} allowed FP32: {dict(allowed_families)}", flush=True)
+
+
+def cast_floating_to_bf16(loaded: Any) -> dict[str, int]:
+    import torch
+
+    changed: Counter[str] = Counter()
+    for _, parameter in loaded.named_parameters():
+        if parameter.is_floating_point() and parameter.dtype != torch.bfloat16:
+            changed[str(parameter.dtype)] += 1
+            parameter.data = parameter.data.to(torch.bfloat16)
+    for module in loaded.modules():
+        for name, buf in list(module._buffers.items()):
+            if buf is None or not buf.is_floating_point() or buf.dtype == torch.bfloat16:
+                continue
+            changed[str(buf.dtype)] += 1
+            module._buffers[name] = buf.to(torch.bfloat16)
+    return dict(changed)
 
 
 def adapter_weight_files(directory: Path) -> list[Path]:

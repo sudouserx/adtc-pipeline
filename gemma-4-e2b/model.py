@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import re
 from pathlib import Path
+from types import MethodType
 from typing import Any, Sequence
 
 SYSTEM_PROMPT = (
@@ -175,41 +177,6 @@ def patch_chat_template(tokenizer: Any) -> None:
         tokenizer.chat_template = fallback + template
     if hasattr(tokenizer, "enable_thinking"):
         tokenizer.enable_thinking = False
-    # #region agent log
-    try:
-        import json as _json
-        import time as _time
-        from pathlib import Path as _Path
-
-        import jinja2 as _jinja2
-
-        _rec = {
-            "sessionId": "846a88",
-            "runId": "pre-fix",
-            "hypothesisId": "C",
-            "location": "model.py:patch_chat_template",
-            "message": "jinja2 before apply_chat_template",
-            "data": {
-                "version": getattr(_jinja2, "__version__", None),
-                "file": getattr(_jinja2, "__file__", None),
-            },
-            "timestamp": int(_time.time() * 1000),
-        }
-        _line = _json.dumps(_rec) + "\n"
-        for _path in (
-            _Path("/home/ebrahim/Desktop/adtc pipeline/.cursor/debug-846a88.log"),
-            _Path(__file__).resolve().parents[1] / ".cursor" / "debug-846a88.log",
-        ):
-            try:
-                _path.parent.mkdir(parents=True, exist_ok=True)
-                with _path.open("a", encoding="utf-8") as _handle:
-                    _handle.write(_line)
-            except Exception:
-                pass
-        print("DEBUG_LOG", _line, flush=True)
-    except Exception as _exc:
-        print("DEBUG_LOG jinja2 probe failed", type(_exc).__name__, _exc, flush=True)
-    # #endregion
     for user_text in ("How should I space maize?", "Nipande mahindi kwa nafasi gani?"):
         implicit = _apply_chat_template(
             tokenizer,
@@ -296,6 +263,35 @@ def apply_chat_template(tokenizer: Any) -> Any:
     return tokenizer
 
 
+def is_allowed_fp32_param(name: str, parameter: Any) -> str | None:
+    """Frozen vision, RMSNorm, and QAT scales may be FP32. Language linears may not.
+
+    Shared-layer k_proj/v_proj stay forbidden even if the loader left them FP32.
+    """
+    if re.search(
+        r"(?:q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj|"
+        r"embed_tokens|lm_head)",
+        name,
+    ) and "language_model" in name:
+        if not re.search(r"(?:vision|visual|audio|mmproj)", name, re.I):
+            return None
+    if not getattr(parameter, "requires_grad", True):
+        return "frozen"
+    if re.search(
+        r"(?:^|[._])(?:vision|visual|audio|mmproj|multi_modal|merger)(?:[._]|$)",
+        name,
+        re.I,
+    ):
+        return "vision"
+    if re.search(r"(?:norm|layernorm|rms)", name, re.I):
+        return "norm"
+    if re.search(r"(?:scale|zero_point|fake_quant)", name, re.I):
+        return "qat"
+    if re.search(r"inv_freq", name, re.I):
+        return "rope"
+    return None
+
+
 def validate_kv_sharing(model: Any, checkpoint_keys: set[str]) -> list[str]:
     model_config = getattr(model, "config", None)
     text_config = getattr(model_config, "text_config", model_config)
@@ -356,6 +352,193 @@ def is_expected_loading_key(key: str) -> bool:
     return bool(EXPECTED_LOADING_KEY.search(key) or SHARED_KV_KEY.search(key))
 
 
+_SHARED_KV_ATTRS = ("k_proj", "v_proj", "k_norm", "v_norm")
+
+
+def _language_attentions(loaded: Any) -> list[tuple[str, Any]]:
+    attentions: list[tuple[str, Any]] = []
+    for name, module in loaded.named_modules():
+        if not hasattr(module, "is_kv_shared_layer") or not hasattr(module, "q_proj"):
+            continue
+        if re.search(r"(?:vision|visual|audio|mmproj)", name, re.I):
+            continue
+        attentions.append((name, module))
+    return attentions
+
+
+def _text_model(loaded: Any) -> Any:
+    for module in loaded.modules():
+        layers = getattr(module, "layers", None)
+        if (
+            layers is not None
+            and hasattr(module, "embed_tokens")
+            and hasattr(module, "forward")
+            and len(layers) == 35
+        ):
+            return module
+    raise RuntimeError("Could not find the Gemma 4 language model module")
+
+
+def _drop_module_attr(module: Any, attr: str) -> bool:
+    if attr in getattr(module, "_modules", {}):
+        del module._modules[attr]
+        if hasattr(module, attr):
+            try:
+                delattr(module, attr)
+            except AttributeError:
+                setattr(module, attr, None)
+        return True
+    if getattr(module, attr, None) is None:
+        return False
+    setattr(module, attr, None)
+    return True
+
+
+def _shared_kv_forward(attn: Any, store: dict[int, tuple[Any, Any]]) -> Any:
+    import transformers.models.gemma4.modeling_gemma4 as gemma4_mod
+
+    apply_rotary_pos_emb = gemma4_mod.apply_rotary_pos_emb
+    eager_attention_forward = gemma4_mod.eager_attention_forward
+    attention_functions = getattr(gemma4_mod, "ALL_ATTENTION_FUNCTIONS", None)
+    if attention_functions is None:
+        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+        attention_functions = ALL_ATTENTION_FUNCTIONS
+
+    def forward(
+        self,
+        hidden_states: Any,
+        position_embeddings: Any,
+        attention_mask: Any = None,
+        past_key_values: Any = None,
+        shared_kv_states: dict[int, tuple[Any, Any]] | None = None,
+        **kwargs: Any,
+    ) -> tuple[Any, Any]:
+        kv_store = shared_kv_states if shared_kv_states is not None else store
+        if self.layer_idx == 0:
+            kv_store.clear()
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+        cos, sin = position_embeddings
+
+        query_states = self.q_proj(hidden_states).view(hidden_shape)
+        query_states = self.q_norm(query_states)
+        query_states = apply_rotary_pos_emb(query_states, cos, sin, unsqueeze_dim=2)
+        query_states = query_states.transpose(1, 2)
+
+        if self.is_kv_shared_layer:
+            try:
+                key_states, value_states = kv_store[self.kv_shared_layer_index]
+            except KeyError as exc:
+                raise RuntimeError(
+                    "Gemma 4 shared layer "
+                    f"{self.layer_idx} has no KV from owner layer "
+                    f"{self.kv_shared_layer_index}"
+                ) from exc
+            key_states = key_states.to(device=query_states.device, dtype=query_states.dtype)
+            value_states = value_states.to(
+                device=query_states.device, dtype=query_states.dtype
+            )
+        else:
+            key_states = self.k_proj(hidden_states).view(hidden_shape)
+            value_states = (
+                self.v_proj(hidden_states).view(hidden_shape)
+                if self.v_proj is not None
+                else key_states
+            )
+            key_states = self.k_norm(key_states)
+            key_states = apply_rotary_pos_emb(key_states, cos, sin, unsqueeze_dim=2)
+            key_states = key_states.transpose(1, 2)
+            value_states = self.v_norm(value_states)
+            value_states = value_states.transpose(1, 2)
+            if past_key_values is not None:
+                key_states, value_states = past_key_values.update(
+                    key_states, value_states, self.layer_idx
+                )
+            if self.store_full_length_kv:
+                kv_store[self.layer_idx] = (key_states, value_states)
+
+        attention_interface = eager_attention_forward
+        if self.config._attn_implementation != "eager":
+            attention_interface = attention_functions[self.config._attn_implementation]
+        attn_output, attn_weights = attention_interface(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=self.attention_dropout if self.training else 0.0,
+            scaling=self.scaling,
+            sliding_window=self.sliding_window,
+            **kwargs,
+        )
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        return self.o_proj(attn_output), attn_weights
+
+    return MethodType(forward, attn)
+
+
+def patch_kv_sharing(loaded: Any) -> dict[str, int]:
+    """Stay on transformers 5.5.0: drop materialized shared KV and always reuse it.
+
+    5.5.0 constructs k_proj/v_proj/k_norm for layers 15-34 and uses those random
+    weights whenever past_key_values is None. The QAT checkpoint omits them.
+    """
+    attentions = _language_attentions(loaded)
+    if not attentions:
+        raise RuntimeError("No Gemma 4 language attention modules were found")
+    shared = [
+        (name, module)
+        for name, module in attentions
+        if getattr(module, "is_kv_shared_layer", False)
+    ]
+    if len(shared) != 20:
+        raise RuntimeError(
+            "Expected 20 KV-shared attention layers, found "
+            f"{len(shared)}"
+        )
+
+    already_stripped = all(
+        getattr(module, "k_proj", None) is None for _, module in shared
+    )
+    first_forward = inspect.signature(shared[0][1].forward)
+    already_threaded = "shared_kv_states" in first_forward.parameters
+    if already_stripped and already_threaded:
+        print("Gemma 4 KV sharing already matches the checkpoint layout", flush=True)
+        return {"patched": 0, "stripped": 0}
+
+    store: dict[int, tuple[Any, Any]] = {}
+    text_model = _text_model(loaded)
+    if not getattr(text_model, "_kuza_shared_kv_wrapped", False):
+        bound_forward = text_model.forward
+
+        def wrapped_text_forward(*args: Any, **kwargs: Any) -> Any:
+            store.clear()
+            return bound_forward(*args, **kwargs)
+
+        text_model.forward = wrapped_text_forward
+        text_model._kuza_shared_kv_wrapped = True
+
+    patched = 0
+    if not already_threaded:
+        for _, module in attentions:
+            module.forward = _shared_kv_forward(module, store)
+            patched += 1
+
+    stripped = 0
+    if not already_stripped:
+        for _, module in shared:
+            for attr in _SHARED_KV_ATTRS:
+                if _drop_module_attr(module, attr):
+                    stripped += 1
+
+    print(
+        f"Patched Gemma 4 KV sharing: patched={patched} stripped={stripped}",
+        flush=True,
+    )
+    return {"patched": patched, "stripped": stripped}
+
+
 def load_merge_base(revision: str) -> tuple[Any, Any]:
     import os
 
@@ -373,6 +556,7 @@ def load_merge_base(revision: str) -> tuple[Any, Any]:
     )
     if not isinstance(loaded, tuple) or len(loaded) != 2:
         raise RuntimeError("Transformers did not return loading_info for the merge base")
+    patch_kv_sharing(loaded[0])
     return loaded
 
 
