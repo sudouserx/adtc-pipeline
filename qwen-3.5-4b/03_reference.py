@@ -16,6 +16,7 @@ from common import (
     assert_model_bf16,
     checkpoint_weight_keys,
     gguf_inventory,
+    help_has,
     hf_token,
     inspect_safetensors_bf16,
     llama_cpp_binaries,
@@ -64,6 +65,24 @@ def merge_bf16(base_revision: str, merged: Path) -> dict:
     assert_adapter_tensors_loaded(loaded, adapter_dir())
     loaded = loaded.merge_and_unload(safe_merge=True)
     assert_model_bf16(loaded, "Merged model")
+    dropped_modalities = []
+    for attr in (
+        "vision_tower",
+        "audio_tower",
+        "multi_modal_projector",
+        "vision_model",
+        "audio_model",
+        "vision_encoder",
+        "audio_encoder",
+        "visual",
+        "audio",
+    ):
+        for obj in (loaded, getattr(loaded, "model", None)):
+            if obj is None or getattr(obj, attr, None) is None:
+                continue
+            setattr(obj, attr, None)
+            dropped_modalities.append(attr)
+    hf_mtp = model.hf_mtp_keys(loaded.state_dict().keys())
     tokenizer = model.load_tokenizer(adapter_dir())
     merged.mkdir(parents=True, exist_ok=True)
     loaded.save_pretrained(
@@ -87,7 +106,12 @@ def merge_bf16(base_revision: str, merged: Path) -> dict:
     del loaded, base
     gc.collect()
     torch.cuda.empty_cache()
-    return {"dtype_counts": dtype_counts}
+    return {
+        "dtype_counts": dtype_counts,
+        "dropped_modalities": sorted(set(dropped_modalities)),
+        "text_only": True,
+        "hf_mtp_tensors": hf_mtp,
+    }
 
 
 def main() -> int:
@@ -106,19 +130,34 @@ def main() -> int:
     env["PYTHONPATH"] = (
         str(llama_root / "gguf-py") + os.pathsep + env.get("PYTHONPATH", "")
     )
-    run(
-        [
-            sys.executable,
-            binaries["converter"],
-            merged,
-            "--outfile",
-            dest,
-            "--outtype",
-            "bf16",
-        ],
-        cwd=llama_root,
-        env=env,
-    )
+    convert_cmd = [
+        sys.executable,
+        binaries["converter"],
+        merged,
+        "--outfile",
+        dest,
+        "--outtype",
+        "bf16",
+    ]
+    try:
+        converter_help = run(
+            [sys.executable, binaries["converter"], "-h"],
+            cwd=llama_root,
+            env=env,
+            capture=True,
+        )
+    except RuntimeError as exc:
+        converter_help = str(exc)
+    mtp_requested = False
+    if help_has(converter_help, "--mtp"):
+        try:
+            run([*convert_cmd, "--mtp"], cwd=llama_root, env=env)
+            mtp_requested = True
+        except RuntimeError:
+            dest.unlink(missing_ok=True)
+            run(convert_cmd, cwd=llama_root, env=env)
+    else:
+        run(convert_cmd, cwd=llama_root, env=env)
     inventory = gguf_inventory(dest, llama_root)
     tensor_types = {name.upper() for name in inventory["tensor_type_counts"]}
     forbidden_types = tensor_types - {"BF16", "F32"}
@@ -126,6 +165,14 @@ def main() -> int:
         raise RuntimeError(
             "Reference GGUF failed BF16 precision gate: "
             f"{inventory['tensor_type_counts']}"
+        )
+    model.assert_text_only_gguf(inventory)
+    mtp_tensors = model.mtp_tensor_names(inventory["tensors"])
+    hf_mtp = merge_details.get("hf_mtp_tensors") or []
+    if hf_mtp and not mtp_tensors:
+        raise RuntimeError(
+            "Merged checkpoint has MTP/nextn tensors but the GGUF dropped them: "
+            f"{hf_mtp[:20]}"
         )
     tokenizer = model.load_tokenizer(adapter)
     smoke_load(
@@ -138,7 +185,15 @@ def main() -> int:
     )
     write_json(
         dest_dir / "reference_manifest.json",
-        {**merge_details, **inventory, "tensors": None},
+        {
+            **merge_details,
+            **inventory,
+            "tensors": None,
+            "text_only": True,
+            "mmproj": False,
+            "mtp_requested": mtp_requested,
+            "mtp_tensors": mtp_tensors,
+        },
     )
     write_json(
         dest_dir / "kuza_system_prompt.json",
@@ -147,7 +202,7 @@ def main() -> int:
             "sha256": sha256_bytes(model.SYSTEM_PROMPT.encode()),
         },
     )
-    shutil.rmtree(merged, ignore_errors=True)
+    print(f"merged: {merged}")
     print(f"reference: {dest}")
     print(f"sha256: {sha256_file(dest)}")
     return 0

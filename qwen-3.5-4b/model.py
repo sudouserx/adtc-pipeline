@@ -6,7 +6,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Iterable, Sequence
 
 SYSTEM_PROMPT = (
     "You are Kuza, a practical agricultural assistant for East African "
@@ -55,9 +55,12 @@ TARGET_SUFFIXES = (
     "k_proj",
     "v_proj",
     "o_proj",
+    "qkv_proj",
     "gate_proj",
     "up_proj",
     "down_proj",
+    "in_proj_qkvz",
+    "in_proj_ba",
     "in_proj_qkv",
     "out_proj",
     "in_proj",
@@ -83,21 +86,38 @@ EXPECTED_LOADING_KEY = re.compile(
     r"(?:^|\.)(?:lm_head|embed_tokens)\.weight$|(?:^|\.)inv_freq$"
 )
 
+# MixCal imatrix on all three. Protect ssm_out (Unsloth: worst hybrid KLD
+# tensor). IQ4_XS dropped: I-quants are slower on AVX2 CPUs.
 QUANT_CANDIDATES = {
     "q4_k_m_imatrix": {
         "base_type": "q4_k_m",
         "filename": "kuza-qwen-q4_k_m.gguf",
-        "preserve_attention_q6": False,
+        "embedding_type": "q6_k",
+        "output_type": "q6_k",
+        "ssm_out_type": "q6_k",
+        "ssm_gate_type": None,
+        "attention_type": None,
+        "attn_gate_type": None,
     },
-    "q4_k_xl_mixed": {
+    "q4_k_xl_ssm": {
         "base_type": "q4_k_m",
         "filename": "kuza-qwen-q4_k_xl.gguf",
-        "preserve_attention_q6": True,
+        "embedding_type": "q8_0",
+        "output_type": "q8_0",
+        "ssm_out_type": "q6_k",
+        "ssm_gate_type": "q5_k",
+        "attention_type": "q6_k",
+        "attn_gate_type": "q6_k",
     },
-    "iq4_xs": {
-        "base_type": "iq4_xs",
-        "filename": "kuza-qwen-iq4_xs.gguf",
-        "preserve_attention_q6": False,
+    "q4_k_s_ssm": {
+        "base_type": "q4_k_s",
+        "filename": "kuza-qwen-q4_k_s.gguf",
+        "embedding_type": "q6_k",
+        "output_type": "q6_k",
+        "ssm_out_type": "q6_k",
+        "ssm_gate_type": None,
+        "attention_type": None,
+        "attn_gate_type": None,
     },
 }
 
@@ -213,20 +233,95 @@ def apply_chat_template(tokenizer: Any) -> Any:
     return tokenizer
 
 
+VISION_NAME = re.compile(
+    r"(?:^|[._])(?:vision|visual|audio|mmproj|multi_modal|merger)(?:[._]|$)",
+    re.IGNORECASE,
+)
+
+
 def validate_kv_sharing(model: Any, checkpoint_keys: set[str]) -> list[str]:
-    return []
+    return validate_hybrid_layout(model, checkpoint_keys)
+
+
+def _text_config(model: Any) -> Any:
+    model_config = getattr(model, "config", None)
+    return getattr(model_config, "text_config", None) or model_config
+
+
+def validate_hybrid_layout(model: Any, checkpoint_keys: set[str]) -> list[str]:
+    text_config = _text_config(model)
+    model_config = getattr(model, "config", None)
+    layer_count = int(
+        getattr(text_config, "num_hidden_layers", 0)
+        or getattr(model_config, "num_hidden_layers", 0)
+    )
+    if layer_count != 32:
+        raise RuntimeError(
+            "Unexpected Qwen 3.5-4B layer count: "
+            f"num_hidden_layers={layer_count} (expected 32)"
+        )
+    layer_types = [str(item).lower() for item in (getattr(text_config, "layer_types", None) or [])]
+    delta_layers: set[int] = set()
+    attn_layers: set[int] = set()
+    if layer_types:
+        if len(layer_types) != 32:
+            raise RuntimeError(
+                f"Unexpected Qwen 3.5-4B layer_types length: {len(layer_types)}"
+            )
+        for index, kind in enumerate(layer_types):
+            if "linear" in kind or "delta" in kind:
+                delta_layers.add(index)
+            elif "full" in kind or kind in {"attention", "gated_attention"}:
+                attn_layers.add(index)
+    else:
+        keys = set(model.state_dict().keys()) | set(checkpoint_keys)
+        for key in keys:
+            match = re.search(r"layers\.(\d+)\.", key)
+            if not match:
+                continue
+            index = int(match.group(1))
+            if re.search(
+                r"linear_attn|ssm_out|in_proj_qkv|in_proj_ba|gated_delta", key
+            ):
+                delta_layers.add(index)
+            if re.search(
+                r"self_attn|\.(?:q_proj|k_proj|v_proj|o_proj|qkv_proj)(?:\.|$)",
+                key,
+            ):
+                attn_layers.add(index)
+    expected_attn = {index for index in range(32) if index % 4 == 3}
+    expected_delta = set(range(32)) - expected_attn
+    if delta_layers != expected_delta or attn_layers != expected_attn:
+        raise RuntimeError(
+            "Unexpected Qwen 3.5-4B hybrid layout: "
+            f"delta_layers={sorted(delta_layers)} ({len(delta_layers)}), "
+            f"attn_layers={sorted(attn_layers)} ({len(attn_layers)}). "
+            "Expected 24 Gated DeltaNet and 8 gated-attention layers "
+            "(8 × (3×DeltaNet → 1×attn))."
+        )
+    return sorted(f"layers.{index}" for index in sorted(delta_layers | attn_layers))
 
 
 def lora_target_names(model: Any) -> str:
     import torch
 
+    module_names = [name for name, _ in model.named_modules()]
+    require_language = any("language_model" in name for name in module_names)
     targets = []
     for name, module in model.named_modules():
+        if VISION_NAME.search(name):
+            continue
+        if require_language and "language_model" not in name:
+            continue
         target_suffix = name.removesuffix(".linear").rsplit(".", 1)[-1]
         if isinstance(module, torch.nn.Linear) and target_suffix in TARGET_SUFFIXES:
             targets.append(name)
     if not targets:
         raise RuntimeError("No LoRA target modules were found")
+    if any(VISION_NAME.search(name) for name in targets):
+        raise RuntimeError("Vision/audio modules leaked into LoRA targets")
+    if require_language and any("language_model" not in name for name in targets):
+        raise RuntimeError("Non-language modules leaked into LoRA targets")
     return "(?:" + "|".join(re.escape(name) for name in targets) + ")"
 
 
@@ -286,6 +381,24 @@ def first_matching_tensors(
     raise RuntimeError(f"No GGUF tensors matched required {family} family")
 
 
+def _normalized_quant_spec(spec: dict[str, Any] | str) -> dict[str, Any]:
+    if isinstance(spec, str):
+        return {
+            "base_type": spec,
+            "embedding_type": "q6_k",
+            "output_type": "q6_k",
+            "ssm_out_type": "q6_k",
+            "ssm_gate_type": None,
+            "attention_type": None,
+            "attn_gate_type": None,
+        }
+    return spec
+
+
+def _gguf_type_name(value: str) -> str:
+    return value.upper().replace(".", "_")
+
+
 def quant_command(
     binary: Any,
     reference: Any,
@@ -293,39 +406,54 @@ def quant_command(
     imatrix: Any,
     spec: dict[str, Any] | str,
 ) -> list[Any]:
-    if isinstance(spec, str):
-        spec = {"base_type": spec, "preserve_attention_q6": False}
+    spec = _normalized_quant_spec(spec)
     base_type = str(spec["base_type"])
-    bulk_type = {
-        "q4_0": "q4_0",
-        "iq4_xs": "iq4_xs",
-        "q4_k_s": "q4_k",
-    }.get(base_type, "q4_k")
-    command = [
-        binary,
-        "--imatrix",
-        imatrix,
-        "--token-embedding-type",
-        "q8_0",
-        "--output-tensor-type",
-        "q8_0",
-    ]
-    if spec.get("preserve_attention_q6", False):
+    bulk_type = "q4_k"
+    command: list[Any] = [binary, "--imatrix", imatrix]
+    if spec.get("embedding_type"):
+        command.extend(["--token-embedding-type", str(spec["embedding_type"])])
+    if spec.get("output_type"):
+        command.extend(["--output-tensor-type", str(spec["output_type"])])
+    if spec.get("ssm_out_type"):
         command.extend(
-            ["--tensor-type", r"blk\..*\.attn_(q|k|v|output|qkv)\.weight=q6_k"]
+            ["--tensor-type", rf"blk\..*\.ssm_out\.weight={spec['ssm_out_type']}"]
         )
-    if bulk_type in {"q4_k", "q4_0"}:
+    if spec.get("ssm_gate_type"):
         command.extend(
             [
                 "--tensor-type",
-                rf"blk\..*\.ffn_gate\.weight={bulk_type}",
+                rf"blk\..*\.ssm_alpha\.weight={spec['ssm_gate_type']}",
                 "--tensor-type",
-                rf"blk\..*\.ffn_up\.weight={bulk_type}",
-                "--tensor-type",
-                rf"blk\..*\.ffn_down\.weight={bulk_type}",
+                rf"blk\..*\.ssm_beta\.weight={spec['ssm_gate_type']}",
             ]
         )
-    command.extend([reference, output, base_type])
+    if spec.get("attention_type"):
+        command.extend(
+            [
+                "--tensor-type",
+                rf"blk\..*\.attn_(q|k|v|output|qkv)\.weight={spec['attention_type']}",
+            ]
+        )
+    if spec.get("attn_gate_type"):
+        command.extend(
+            [
+                "--tensor-type",
+                rf"blk\..*\.attn_gate\.weight={spec['attn_gate_type']}",
+            ]
+        )
+    command.extend(
+        [
+            "--tensor-type",
+            rf"blk\..*\.ffn_gate\.weight={bulk_type}",
+            "--tensor-type",
+            rf"blk\..*\.ffn_up\.weight={bulk_type}",
+            "--tensor-type",
+            rf"blk\..*\.ffn_down\.weight={bulk_type}",
+            reference,
+            output,
+            base_type,
+        ]
+    )
     return command
 
 
@@ -333,10 +461,56 @@ def validate_quant_overrides(
     inventory: dict[str, Any],
     spec: dict[str, Any] | str,
 ) -> None:
-    if isinstance(spec, str):
-        spec = {"base_type": spec, "preserve_attention_q6": False}
+    spec = _normalized_quant_spec(spec)
     base_type = str(spec["base_type"])
     tensors = inventory["tensors"]
+    families: list[tuple[str, list[str], str]] = []
+    if spec.get("ssm_out_type"):
+        families.append(
+            (
+                "ssm_out",
+                [r"blk\..*\.ssm_out\.weight$"],
+                _gguf_type_name(str(spec["ssm_out_type"])),
+            )
+        )
+    if spec.get("ssm_gate_type"):
+        families.append(
+            (
+                "ssm_gates",
+                [r"blk\..*\.ssm_(alpha|beta)\.weight$"],
+                _gguf_type_name(str(spec["ssm_gate_type"])),
+            )
+        )
+    if spec.get("attention_type"):
+        families.append(
+            (
+                "attention",
+                [
+                    r"blk\..*\.attn_(q|k|v|output)\.weight$",
+                    r"blk\..*\.attn_qkv\.weight$",
+                ],
+                _gguf_type_name(str(spec["attention_type"])),
+            )
+        )
+    if spec.get("attn_gate_type"):
+        families.append(
+            (
+                "attn_gate",
+                [r"blk\..*\.attn_gate\.weight$"],
+                _gguf_type_name(str(spec["attn_gate_type"])),
+            )
+        )
+    for family, patterns, expected in families:
+        matched = first_matching_tensors(tensors, patterns, family)
+        wrong = {
+            name: dtype
+            for name, dtype in matched.items()
+            if _gguf_type_name(dtype) != expected
+        }
+        if wrong:
+            raise RuntimeError(
+                f"Quantizer ignored {expected} override for {family}: {wrong}"
+            )
     embedding_names = [
         name
         for name in ("token_embd.weight", "output.weight", "token_embd", "output")
@@ -345,34 +519,61 @@ def validate_quant_overrides(
     if not embedding_names:
         raise RuntimeError("No token embedding or output tensors were found")
     for name in embedding_names:
-        if tensors[name].upper() not in {"Q8_0", "Q6_K", "Q5_K"}:
-            raise RuntimeError(f"{name} should be high-precision, found {tensors[name]}")
-    if spec.get("preserve_attention_q6", False):
-        matched = first_matching_tensors(
-            tensors,
-            [r"blk\..*\.attn_(q|k|v|output)\.weight$", r"blk\..*\.attn_qkv\.weight$"],
-            "attention",
-        )
-        wrong = {
-            name: dtype for name, dtype in matched.items() if dtype.upper() != "Q6_K"
-        }
-        if wrong:
-            raise RuntimeError(f"Quantizer ignored Q6_K override for attention: {wrong}")
-    if base_type == "iq4_xs":
-        return
+        if name in {"output.weight", "output"} and spec.get("output_type"):
+            wanted = _gguf_type_name(str(spec["output_type"]))
+        elif spec.get("embedding_type"):
+            wanted = _gguf_type_name(str(spec["embedding_type"]))
+        else:
+            continue
+        if _gguf_type_name(tensors[name]) != wanted:
+            raise RuntimeError(f"{name} should be {wanted}, found {tensors[name]}")
     bulk = {
-        name: dtype.upper()
+        name: _gguf_type_name(dtype)
         for name, dtype in tensors.items()
         if re.search(r"blk\..*\.ffn_(?:gate|up|down)\.weight$", name)
     }
     if not bulk:
         return
-    allowed_bulk = {"Q4_K", "Q4_0", "Q3_K", "IQ4_XS"}
+    allowed_bulk = {"Q4_K"}
     wrong_bulk = {name: dtype for name, dtype in bulk.items() if dtype not in allowed_bulk}
     if wrong_bulk:
         raise RuntimeError(
             f"Unexpected {base_type} bulk tensor types: {dict(list(wrong_bulk.items())[:20])}"
         )
+
+
+def multimodal_tensor_names(tensors: dict[str, str]) -> list[str]:
+    leaked: list[str] = []
+    for name in tensors:
+        lower = name.lower()
+        if name.startswith(("v.", "a.", "audio.", "vision.")) or "mmproj" in lower:
+            leaked.append(name)
+    return leaked
+
+
+def assert_text_only_gguf(inventory: dict[str, Any]) -> None:
+    leaked = multimodal_tensor_names(inventory["tensors"])
+    if leaked:
+        raise RuntimeError(
+            "GGUF is not text-only; multimodal tensors leaked: "
+            f"{leaked[:20]}"
+        )
+
+
+def mtp_tensor_names(tensors: dict[str, str]) -> list[str]:
+    return [
+        name
+        for name in tensors
+        if re.search(r"(?:^|[._])(?:mtp|draft|nextn)(?:[._]|$)", name, re.I)
+    ]
+
+
+def hf_mtp_keys(keys: Iterable[str]) -> list[str]:
+    return [
+        name
+        for name in keys
+        if re.search(r"(?:^|[._])(?:mtp|nextn)(?:[._]|$)", name, re.I)
+    ]
 
 
 def smoke_warnings(prompt_name: str, output: str) -> list[str]:
