@@ -199,6 +199,33 @@ def patch_chat_template(tokenizer: Any) -> None:
             bos = getattr(tokenizer, "bos_token", None)
             if bos and rendered.count(bos) > 1:
                 raise RuntimeError("Rendered template contains duplicate BOS tokens")
+    completed = _apply_chat_template(
+        tokenizer,
+        [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": "How should I space maize?"},
+            {"role": "model", "content": "Plant 75 cm between rows."},
+        ],
+        tokenize=False,
+        add_generation_prompt=False,
+    )
+    assert_rendered_chat(tokenizer, completed)
+    if RESPONSE_PART not in completed:
+        raise RuntimeError("Completed chat is missing the model turn marker")
+    try:
+        completed_assistant = _apply_chat_template(
+            tokenizer,
+            [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": "How should I space maize?"},
+                {"role": "assistant", "content": "Plant 75 cm between rows."},
+            ],
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+        assert_rendered_chat(tokenizer, completed_assistant)
+    except Exception:
+        pass
 
 
 def assert_rendered_chat(tokenizer: Any, rendered: str) -> None:
@@ -211,29 +238,65 @@ def assert_rendered_chat(tokenizer: Any, rendered: str) -> None:
         raise RuntimeError("Rendered chat must contain exactly one BOS token")
 
 
+_USER_ROLES = {"user", "human"}
+_MODEL_ROLES = {"assistant", "model", "gpt"}
+
+
+def _gemma_role(role: str) -> str | None:
+    lowered = role.lower()
+    if lowered in _USER_ROLES:
+        return "user"
+    if lowered in _MODEL_ROLES:
+        return "model"
+    return None
+
+
+def _alternating_user_model(turns: list[dict[str, str]]) -> list[dict[str, str]]:
+    merged: list[dict[str, str]] = []
+    for turn in turns:
+        if merged and merged[-1]["role"] == turn["role"]:
+            merged[-1]["content"] = f"{merged[-1]['content']}\n{turn['content']}".strip()
+        else:
+            merged.append({"role": turn["role"], "content": turn["content"]})
+    while merged and merged[0]["role"] != "user":
+        merged.pop(0)
+    if not merged or merged[-1]["role"] != "model":
+        return []
+    expected = ("user", "model")
+    if any(turn["role"] != expected[index % 2] for index, turn in enumerate(merged)):
+        return []
+    return merged
+
+
 def dialog_messages(row: dict[str, Any]) -> list[dict[str, str]]:
+    raw: list[dict[str, str]] = []
     messages = row.get("messages")
     if isinstance(messages, list) and messages:
-        cleaned = []
         for turn in messages:
             if not isinstance(turn, dict):
                 continue
-            role = str(turn.get("role", "")).lower()
+            role = _gemma_role(str(turn.get("role", "")))
             content = str(turn.get("content", "")).strip()
-            if role in {"user", "assistant"} and content:
-                cleaned.append({"role": role, "content": content})
-        if cleaned:
-            return cleaned
-    return [
-        {"role": "user", "content": row["instruction"]},
-        {"role": "assistant", "content": row["response"]},
-    ]
+            if role and content:
+                raw.append({"role": role, "content": content})
+    if not raw:
+        instruction = str(row.get("instruction", "")).strip()
+        response = str(row.get("response", "")).strip()
+        if instruction and response:
+            raw = [
+                {"role": "user", "content": instruction},
+                {"role": "model", "content": response},
+            ]
+    return _alternating_user_model(raw)
 
 
 def render_text(tokenizer: Any, row: dict[str, str]) -> str:
+    dialog = dialog_messages(row)
+    if not dialog:
+        raise RuntimeError("Row has no alternating user/model turns")
     rendered = _apply_chat_template(
         tokenizer,
-        [{"role": "system", "content": SYSTEM_PROMPT}, *dialog_messages(row)],
+        [{"role": "system", "content": SYSTEM_PROMPT}, *dialog],
         tokenize=False,
         add_generation_prompt=False,
     )
@@ -276,17 +339,28 @@ def decode_ids(obj: Any, ids: list[int]) -> str:
 
 
 def apply_chat_template(tokenizer: Any) -> Any:
+    from jinja2.exceptions import TemplateError
     from unsloth.chat_templates import get_chat_template
 
-    tokenizer = get_chat_template(tokenizer, chat_template=CHAT_TEMPLATE_NAME)
-    patch_chat_template(tokenizer)
-    inner = text_tokenizer(tokenizer)
-    if inner is not tokenizer:
-        inner.chat_template = tokenizer.chat_template
-        if hasattr(tokenizer, "enable_thinking"):
-            inner.enable_thinking = tokenizer.enable_thinking
-        return inner
-    return tokenizer
+    checkpoint = text_tokenizer(tokenizer)
+    checkpoint_template = getattr(tokenizer, "chat_template", None) or getattr(
+        checkpoint, "chat_template", None
+    )
+    wrapped = get_chat_template(tokenizer, chat_template=CHAT_TEMPLATE_NAME)
+    inner = text_tokenizer(wrapped)
+    if inner is not wrapped:
+        if getattr(wrapped, "chat_template", None):
+            inner.chat_template = wrapped.chat_template
+        if hasattr(wrapped, "enable_thinking"):
+            inner.enable_thinking = wrapped.enable_thinking
+    try:
+        patch_chat_template(inner)
+    except (RuntimeError, TemplateError):
+        if not checkpoint_template:
+            raise
+        inner.chat_template = checkpoint_template
+        patch_chat_template(inner)
+    return inner
 
 
 def is_allowed_fp32_param(name: str, parameter: Any) -> str | None:

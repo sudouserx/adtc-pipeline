@@ -644,8 +644,14 @@ def prepare_sft_data(
         valid: list[dict[str, str]] = []
         invalid = 0
         truncated = 0
+        from jinja2.exceptions import TemplateError
+
         for row in rows:
-            text = model.render_text(tokenizer, row)
+            try:
+                text = model.render_text(tokenizer, row)
+            except (TemplateError, RuntimeError):
+                invalid += 1
+                continue
             full_ids = model.encode_ids(tokenizer, text)
             is_truncated = len(full_ids) > config.MAX_SEQ_LENGTH
             # keep_start: never left-slice. A tail crop drops the system/user
