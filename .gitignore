@@ -1,0 +1,11 @@
+data/final/*.jsonl
+data/.hf-cache/
+data/final/*.progress.jsonl
+data/final/*.failed.jsonl
+data/final/*.batch_state.json
+**/__pycache__/
+*.pyc
+.hf-cache/
+experiments/results/
+experiments/provenance/
+experiments/cache/
