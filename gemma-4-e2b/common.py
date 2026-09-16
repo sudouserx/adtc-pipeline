@@ -636,7 +636,7 @@ def prepare_sft_data(
 ) -> tuple[Any, Any, dict[str, Any]]:
     from datasets import Dataset
 
-    marker_ids = tokenizer(model.RESPONSE_PART, add_special_tokens=False)["input_ids"]
+    marker_ids = model.encode_ids(tokenizer, model.RESPONSE_PART)
 
     def process(
         rows: list[dict[str, str]], split: str
@@ -646,7 +646,7 @@ def prepare_sft_data(
         truncated = 0
         for row in rows:
             text = model.render_text(tokenizer, row)
-            full_ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+            full_ids = model.encode_ids(tokenizer, text)
             is_truncated = len(full_ids) > config.MAX_SEQ_LENGTH
             # keep_start: never left-slice. A tail crop drops the system/user
             # turn and can still match RESPONSE_PART on the assistant answer.
@@ -656,7 +656,7 @@ def prepare_sft_data(
             has_response = contains_subsequence(limited_ids, marker_ids)
             if is_truncated:
                 truncated += 1
-                text = tokenizer.decode(limited_ids, skip_special_tokens=False)
+                text = model.decode_ids(tokenizer, limited_ids)
             if not has_response or len(limited_ids) <= len(marker_ids) + 1:
                 invalid += 1
                 continue
@@ -1010,10 +1010,10 @@ def render_corpus(
     total_tokens = 0
     for row in rows:
         text = model.render_text(tokenizer, row)
-        ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+        ids = model.encode_ids(tokenizer, text)
         if len(ids) > max_seq_length:
             ids = ids[:max_seq_length]
-            text = tokenizer.decode(ids, skip_special_tokens=False)
+            text = model.decode_ids(tokenizer, ids)
             truncated += 1
         total_tokens += len(ids)
         rendered_rows.append(text)

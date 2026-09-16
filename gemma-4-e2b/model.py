@@ -255,11 +255,37 @@ def render_generation_prompt(tokenizer: Any, prompt: str) -> str:
     return rendered
 
 
+def text_tokenizer(obj: Any) -> Any:
+    inner = getattr(obj, "tokenizer", None)
+    if inner is not None and inner is not obj:
+        return text_tokenizer(inner)
+    return obj
+
+
+def encode_ids(obj: Any, text: str) -> list[int]:
+    tokenizer = text_tokenizer(obj)
+    encoded = tokenizer(text, add_special_tokens=False)
+    ids = encoded["input_ids"] if isinstance(encoded, dict) else encoded
+    if ids and isinstance(ids[0], list):
+        ids = ids[0]
+    return list(ids)
+
+
+def decode_ids(obj: Any, ids: list[int]) -> str:
+    return text_tokenizer(obj).decode(ids, skip_special_tokens=False)
+
+
 def apply_chat_template(tokenizer: Any) -> Any:
     from unsloth.chat_templates import get_chat_template
 
     tokenizer = get_chat_template(tokenizer, chat_template=CHAT_TEMPLATE_NAME)
     patch_chat_template(tokenizer)
+    inner = text_tokenizer(tokenizer)
+    if inner is not tokenizer:
+        inner.chat_template = tokenizer.chat_template
+        if hasattr(tokenizer, "enable_thinking"):
+            inner.enable_thinking = tokenizer.enable_thinking
+        return inner
     return tokenizer
 
 
