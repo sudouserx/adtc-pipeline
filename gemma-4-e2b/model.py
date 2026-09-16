@@ -238,6 +238,11 @@ def assert_rendered_chat(tokenizer: Any, rendered: str) -> None:
         raise RuntimeError("Rendered chat must contain exactly one BOS token")
 
 
+def has_response_marker(text: str) -> bool:
+    index = text.find(RESPONSE_PART)
+    return index >= 0 and len(text) > index + len(RESPONSE_PART) + 1
+
+
 _USER_ROLES = {"user", "human"}
 _MODEL_ROLES = {"assistant", "model", "gpt"}
 
