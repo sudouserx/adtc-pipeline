@@ -56,5 +56,6 @@ PINNED_PACKAGES = {
     "sentencepiece": "0.2.1",
     "tokenizers": "0.22.2",
     "protobuf": "5.29.5",
+    "jinja2": "3.1.6",
 }
 TORCH_CUDA_PACKAGES = ("torch", "torchvision", "xformers")

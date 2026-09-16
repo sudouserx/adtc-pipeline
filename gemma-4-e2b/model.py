@@ -175,6 +175,41 @@ def patch_chat_template(tokenizer: Any) -> None:
         tokenizer.chat_template = fallback + template
     if hasattr(tokenizer, "enable_thinking"):
         tokenizer.enable_thinking = False
+    # #region agent log
+    try:
+        import json as _json
+        import time as _time
+        from pathlib import Path as _Path
+
+        import jinja2 as _jinja2
+
+        _rec = {
+            "sessionId": "846a88",
+            "runId": "pre-fix",
+            "hypothesisId": "C",
+            "location": "model.py:patch_chat_template",
+            "message": "jinja2 before apply_chat_template",
+            "data": {
+                "version": getattr(_jinja2, "__version__", None),
+                "file": getattr(_jinja2, "__file__", None),
+            },
+            "timestamp": int(_time.time() * 1000),
+        }
+        _line = _json.dumps(_rec) + "\n"
+        for _path in (
+            _Path("/home/ebrahim/Desktop/adtc pipeline/.cursor/debug-846a88.log"),
+            _Path(__file__).resolve().parents[1] / ".cursor" / "debug-846a88.log",
+        ):
+            try:
+                _path.parent.mkdir(parents=True, exist_ok=True)
+                with _path.open("a", encoding="utf-8") as _handle:
+                    _handle.write(_line)
+            except Exception:
+                pass
+        print("DEBUG_LOG", _line, flush=True)
+    except Exception as _exc:
+        print("DEBUG_LOG jinja2 probe failed", type(_exc).__name__, _exc, flush=True)
+    # #endregion
     for user_text in ("How should I space maize?", "Nipande mahindi kwa nafasi gani?"):
         implicit = _apply_chat_template(
             tokenizer,
