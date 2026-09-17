@@ -697,16 +697,24 @@ def prepare_sft_data(
 ) -> tuple[Any, Any, dict[str, Any]]:
     from datasets import Dataset
 
-    marker_ids = model.encode_ids(tokenizer, model.RESPONSE_PART)
-
     def process(
         rows: list[dict[str, str]], split: str
     ) -> tuple[list[dict[str, str]], dict[str, Any]]:
         valid: list[dict[str, str]] = []
-        invalid = 0
+        render_failed = 0
+        missing_marker = 0
         truncated = 0
+        first_error: str | None = None
+        from jinja2.exceptions import TemplateError
+
         for row in rows:
-            text = model.render_text(tokenizer, row)
+            try:
+                text = model.render_text(tokenizer, row)
+            except (TemplateError, RuntimeError) as exc:
+                render_failed += 1
+                if first_error is None:
+                    first_error = repr(exc)
+                continue
             full_ids = model.encode_ids(tokenizer, text)
             is_truncated = len(full_ids) > config.MAX_SEQ_LENGTH
             # keep_start: never left-slice. A tail crop drops the system/user
@@ -714,19 +722,22 @@ def prepare_sft_data(
             limited_ids = (
                 full_ids[: config.MAX_SEQ_LENGTH] if is_truncated else full_ids
             )
-            has_response = contains_subsequence(limited_ids, marker_ids)
             if is_truncated:
                 truncated += 1
                 text = model.decode_ids(tokenizer, limited_ids)
-            if not has_response or len(limited_ids) <= len(marker_ids) + 1:
-                invalid += 1
+            if not model.has_response_marker(text):
+                missing_marker += 1
                 continue
             valid.append({**row, "text": text})
+        invalid = render_failed + missing_marker
         report = {
             "split": split,
             "input_rows": len(rows),
             "valid_rows": len(valid),
             "invalid_rows": invalid,
+            "render_failed": render_failed,
+            "missing_marker": missing_marker,
+            "first_error": first_error,
             "invalid_fraction": invalid / max(1, len(rows)),
             "truncated_rows": truncated,
             "truncated_fraction": truncated / max(1, len(rows)),

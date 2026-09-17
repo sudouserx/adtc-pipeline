@@ -134,6 +134,17 @@ DOSAGE_PATTERN = re.compile(
 )
 
 
+def _apply_chat_template(tokenizer: Any, messages: list[dict[str, str]], **kwargs: Any) -> str:
+    try:
+        return tokenizer.apply_chat_template(
+            messages,
+            chat_template_kwargs={"enable_thinking": False},
+            **kwargs,
+        )
+    except TypeError:
+        return tokenizer.apply_chat_template(messages, **kwargs)
+
+
 def patch_chat_template(tokenizer: Any) -> None:
     marker = "KUZA_CANONICAL_SYSTEM_PROMPT"
     template = tokenizer.chat_template
@@ -151,26 +162,40 @@ def patch_chat_template(tokenizer: Any) -> None:
             "{%- endif -%}\n"
         )
         tokenizer.chat_template = fallback + template
-    tokenizer.enable_thinking = False
+    if hasattr(tokenizer, "enable_thinking"):
+        tokenizer.enable_thinking = False
     for user_text in ("How should I space maize?", "Nipande mahindi kwa nafasi gani?"):
-        implicit = tokenizer.apply_chat_template(
+        implicit = _apply_chat_template(
+            tokenizer,
             [{"role": "user", "content": user_text}],
             tokenize=False,
             add_generation_prompt=True,
-            chat_template_kwargs={"enable_thinking": False},
         )
-        explicit = tokenizer.apply_chat_template(
+        explicit = _apply_chat_template(
+            tokenizer,
             [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_text},
             ],
             tokenize=False,
             add_generation_prompt=True,
-            chat_template_kwargs={"enable_thinking": False},
         )
         for rendered in (implicit, explicit):
             if rendered.count(SYSTEM_PROMPT) != 1:
                 raise RuntimeError("Rendered template does not contain exactly one prompt")
+    completed = _apply_chat_template(
+        tokenizer,
+        [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": "How should I space maize?"},
+            {"role": "assistant", "content": "Plant 75 cm between rows."},
+        ],
+        tokenize=False,
+        add_generation_prompt=False,
+    )
+    assert_rendered_chat(tokenizer, completed)
+    if not has_response_marker(completed):
+        raise RuntimeError("Completed chat is missing the assistant turn marker")
 
 
 def assert_rendered_chat(tokenizer: Any, rendered: str) -> None:
@@ -178,6 +203,11 @@ def assert_rendered_chat(tokenizer: Any, rendered: str) -> None:
         raise RuntimeError("Rendered chat must contain exactly one canonical system prompt")
     if SYSTEM_BLOCK_MARKER not in rendered:
         raise RuntimeError("Rendered chat must contain a Qwen system block")
+
+
+def has_response_marker(text: str) -> bool:
+    index = text.find(RESPONSE_PART)
+    return index >= 0 and len(text) > index + len(RESPONSE_PART) + 1
 
 
 def dialog_messages(row: dict[str, Any]) -> list[dict[str, str]]:
@@ -200,25 +230,25 @@ def dialog_messages(row: dict[str, Any]) -> list[dict[str, str]]:
 
 
 def render_text(tokenizer: Any, row: dict[str, str]) -> str:
-    rendered = tokenizer.apply_chat_template(
+    rendered = _apply_chat_template(
+        tokenizer,
         [{"role": "system", "content": SYSTEM_PROMPT}, *dialog_messages(row)],
         tokenize=False,
         add_generation_prompt=False,
-        chat_template_kwargs={"enable_thinking": False},
     )
     assert_rendered_chat(tokenizer, rendered)
     return rendered
 
 
 def render_generation_prompt(tokenizer: Any, prompt: str) -> str:
-    rendered = tokenizer.apply_chat_template(
+    rendered = _apply_chat_template(
+        tokenizer,
         [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ],
         tokenize=False,
         add_generation_prompt=True,
-        chat_template_kwargs={"enable_thinking": False},
     )
     assert_rendered_chat(tokenizer, rendered)
     return rendered
