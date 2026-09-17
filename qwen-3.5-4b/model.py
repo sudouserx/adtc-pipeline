@@ -44,7 +44,6 @@ MIX = {
     "eval_group_max": 500,
 }
 
-CHAT_TEMPLATE_NAME = "qwen3.5"
 INSTRUCTION_PART = "<|im_start|>user\n"
 RESPONSE_PART = "<|im_start|>assistant\n"
 SYSTEM_BLOCK_MARKER = "<|im_start|>system"
@@ -226,9 +225,12 @@ def render_generation_prompt(tokenizer: Any, prompt: str) -> str:
 
 
 def apply_chat_template(tokenizer: Any) -> Any:
-    from unsloth.chat_templates import get_chat_template
-
-    tokenizer = get_chat_template(tokenizer, chat_template=CHAT_TEMPLATE_NAME)
+    # Qwen 3.5 ships chat_template.jinja on the checkpoint; Unsloth has no "qwen3.5" key.
+    if not getattr(tokenizer, "chat_template", None):
+        raise RuntimeError(
+            f"{BASE_MODEL} tokenizer has no chat_template; "
+            "use an instruction/chat checkpoint"
+        )
     patch_chat_template(tokenizer)
     return tokenizer
 
