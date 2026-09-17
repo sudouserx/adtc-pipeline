@@ -224,15 +224,40 @@ def render_generation_prompt(tokenizer: Any, prompt: str) -> str:
     return rendered
 
 
+def text_tokenizer(obj: Any) -> Any:
+    inner = getattr(obj, "tokenizer", None)
+    if inner is not None and inner is not obj:
+        return text_tokenizer(inner)
+    return obj
+
+
+def encode_ids(obj: Any, text: str) -> list[int]:
+    tokenizer = text_tokenizer(obj)
+    encoded = tokenizer(text, add_special_tokens=False)
+    ids = encoded["input_ids"] if isinstance(encoded, dict) else encoded
+    if ids and isinstance(ids[0], list):
+        ids = ids[0]
+    return list(ids)
+
+
+def decode_ids(obj: Any, ids: list[int]) -> str:
+    return text_tokenizer(obj).decode(ids, skip_special_tokens=False)
+
+
 def apply_chat_template(tokenizer: Any) -> Any:
-    # Qwen 3.5 ships chat_template.jinja on the checkpoint; Unsloth has no "qwen3.5" key.
-    if not getattr(tokenizer, "chat_template", None):
+    # FastModel may return a VL processor; SFT is text-only — use the inner tokenizer.
+    inner = text_tokenizer(tokenizer)
+    if not getattr(inner, "chat_template", None):
+        outer_template = getattr(tokenizer, "chat_template", None)
+        if outer_template:
+            inner.chat_template = outer_template
+    if not getattr(inner, "chat_template", None):
         raise RuntimeError(
             f"{BASE_MODEL} tokenizer has no chat_template; "
             "use an instruction/chat checkpoint"
         )
-    patch_chat_template(tokenizer)
-    return tokenizer
+    patch_chat_template(inner)
+    return inner
 
 
 VISION_NAME = re.compile(
