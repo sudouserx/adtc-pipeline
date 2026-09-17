@@ -49,28 +49,20 @@ RESPONSE_PART = "<|im_start|>assistant\n"
 SYSTEM_BLOCK_MARKER = "<|im_start|>system"
 TEMPLATE_LEAK_TOKEN = "<|im_start|>"
 
-# Qwen3.5-4B has two attention families:
-#   * Gated DeltaNet: in_proj_qkv / in_proj_z / in_proj_b / in_proj_a / out_proj
-#   * Gated full attention: q_proj / k_proj / v_proj / o_proj
-# Both families share the standard SwiGLU MLP projections.
-#
-# IMPORTANT: PEFT treats a *list* of target_modules as exact names OR suffixes,
-# while a string is interpreted as a regex.  We deliberately use suffixes here
-# instead of constructing a regex from the current wrapper's absolute names.
-# This remains valid when Unsloth unwraps/re-wraps the Qwen3.5 language model.
 TARGET_SUFFIXES = (
     "q_proj",
     "k_proj",
     "v_proj",
     "o_proj",
-    "in_proj_qkv",
-    "in_proj_z",
-    "in_proj_b",
-    "in_proj_a",
-    "out_proj",
+    "qkv_proj",
     "gate_proj",
     "up_proj",
     "down_proj",
+    "in_proj_qkvz",
+    "in_proj_ba",
+    "in_proj_qkv",
+    "out_proj",
+    "in_proj",
 )
 
 LORA = {
@@ -308,7 +300,7 @@ def is_allowed_fp32_param(name: str, parameter: Any) -> str | None:
     """SSM A_log/dt_bias, frozen vision, and norms may be FP32. Language linears may not."""
     if re.search(
         r"(?:q_proj|k_proj|v_proj|o_proj|qkv_proj|gate_proj|up_proj|down_proj|"
-        r"in_proj_qkvz|in_proj_ba|in_proj_qkv|in_proj_a|in_proj_b|in_proj_z|out_proj|embed_tokens|lm_head)",
+        r"in_proj_qkvz|in_proj_ba|in_proj_qkv|out_proj|embed_tokens|lm_head)",
         name,
     ) and not re.search(r"(?:vision|visual|audio|mmproj|A_log|dt_bias|_fp32_params)", name, re.I):
         return None
@@ -388,63 +380,27 @@ def validate_hybrid_layout(model: Any, checkpoint_keys: set[str]) -> list[str]:
     return sorted(f"layers.{index}" for index in sorted(delta_layers | attn_layers))
 
 
-def lora_target_names(model: Any) -> list[str]:
-    """Return PEFT LoRA targets as stable module-name suffixes.
-
-    PEFT supports target_modules as either:
-      * a string regex, or
-      * a list of exact names / suffixes.
-
-    The previous implementation built a giant regex from the model's current
-    absolute paths (for example ``model.language_model.layers.0...``).  That is
-    fragile because Unsloth may unwrap or re-wrap the Qwen3.5 model between
-    target discovery and PEFT injection.  Suffix matching survives those
-    wrapper changes and is the idiomatic PEFT representation for LoRA targets.
-    """
+def lora_target_names(model: Any) -> str:
     import torch
 
     module_names = [name for name, _ in model.named_modules()]
     require_language = any("language_model" in name for name in module_names)
-
-    # Keep only suffixes that actually exist as Linear modules in the current
-    # model.  This avoids relying on architecture-specific fused names and
-    # prevents unrelated/multimodal modules from becoming targets.
-    present: set[str] = set()
+    targets = []
     for name, module in model.named_modules():
-        if not isinstance(module, torch.nn.Linear):
-            continue
         if VISION_NAME.search(name):
             continue
         if require_language and "language_model" not in name:
             continue
-        suffix = name.removesuffix(".linear").rsplit(".", 1)[-1]
-        if suffix in TARGET_SUFFIXES:
-            present.add(suffix)
-
-    targets = [suffix for suffix in TARGET_SUFFIXES if suffix in present]
+        target_suffix = name.removesuffix(".linear").rsplit(".", 1)[-1]
+        if isinstance(module, torch.nn.Linear) and target_suffix in TARGET_SUFFIXES:
+            targets.append(name)
     if not targets:
-        raise RuntimeError(
-            "No LoRA target modules were found. "
-            f"Expected one or more of: {TARGET_SUFFIXES}"
-        )
-
-    # Validate that every requested suffix has at least one concrete match.
-    # PEFT intentionally permits unmatched entries in a target list, but this
-    # check makes architecture/version drift visible during training setup.
-    if require_language:
-        concrete = []
-        for name, module in model.named_modules():
-            if not isinstance(module, torch.nn.Linear):
-                continue
-            if VISION_NAME.search(name) or "language_model" not in name:
-                continue
-            suffix = name.removesuffix(".linear").rsplit(".", 1)[-1]
-            if suffix in targets:
-                concrete.append(name)
-        if not concrete:
-            raise RuntimeError("LoRA target validation found no language-model Linear modules")
-
-    return targets
+        raise RuntimeError("No LoRA target modules were found")
+    if any(VISION_NAME.search(name) for name in targets):
+        raise RuntimeError("Vision/audio modules leaked into LoRA targets")
+    if require_language and any("language_model" not in name for name in targets):
+        raise RuntimeError("Non-language modules leaked into LoRA targets")
+    return "(?:" + "|".join(re.escape(name) for name in targets) + ")"
 
 
 def assert_no_shared_kv_lora(adapter_parameter_names: list[str]) -> None:
