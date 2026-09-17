@@ -799,10 +799,23 @@ def validate_quant_overrides(
             for name, dtype in matched.items()
             if _gguf_type_name(dtype) != expected
         }
-        if wrong:
-            raise RuntimeError(
-                f"Quantizer ignored {expected} override for {family}: {wrong}"
+        if not wrong:
+            continue
+        leftover = {
+            name: dtype
+            for name, dtype in wrong.items()
+            if family == "per_layer_model_proj"
+            and _gguf_type_name(dtype) in {"BF16", "F16", "F32"}
+        }
+        if leftover and leftover == wrong:
+            print(
+                f"llama-quantize left {family} at {leftover}; requested {expected}",
+                flush=True,
             )
+            continue
+        raise RuntimeError(
+            f"Quantizer ignored {expected} override for {family}: {wrong}"
+        )
     embedding_names = [
         name
         for name in ("token_embd.weight", "output.weight", "token_embd", "output")
