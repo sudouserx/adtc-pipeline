@@ -96,11 +96,23 @@ def run(
     env: dict[str, str] | None = None,
     capture: bool = False,
     log_path: Path | None = None,
+    stdin: Any = None,
+    timeout: float | None = None,
 ) -> str:
     cmd = [str(part) for part in command]
     print("+", " ".join(cmd), flush=True)
+    run_kwargs: dict[str, Any] = {"cwd": cwd, "env": env, "check": False}
+    if stdin is not None:
+        run_kwargs["stdin"] = stdin
+    if timeout is not None:
+        run_kwargs["timeout"] = timeout
     if log_path is None and not capture:
-        result = subprocess.run(cmd, cwd=cwd, env=env, check=False)
+        try:
+            result = subprocess.run(cmd, **run_kwargs)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"Command timed out after {timeout}s: {' '.join(cmd)}"
+            ) from exc
         if result.returncode:
             raise RuntimeError(
                 f"Command failed with exit code {result.returncode}: {' '.join(cmd)}"
@@ -108,32 +120,57 @@ def run(
         return ""
     if log_path:
         log_path.parent.mkdir(parents=True, exist_ok=True)
-    chunks: list[str] = []
-    with contextlib.ExitStack() as stack:
-        log_file = (
-            stack.enter_context(log_path.open("w", encoding="utf-8"))
-            if log_path
-            else None
-        )
-        process = subprocess.Popen(
-            cmd,
-            cwd=cwd,
-            env=env,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            bufsize=1,
-        )
-        assert process.stdout is not None
-        for line in process.stdout:
+    popen_kwargs: dict[str, Any] = {
+        "cwd": cwd,
+        "env": env,
+        "text": True,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+    }
+    if stdin is not None:
+        popen_kwargs["stdin"] = stdin
+    if timeout is not None:
+        with contextlib.ExitStack() as stack:
+            log_file = (
+                stack.enter_context(log_path.open("w", encoding="utf-8"))
+                if log_path
+                else None
+            )
+            process = subprocess.Popen(cmd, **popen_kwargs)
+            try:
+                stdout_data, _ = process.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired as exc:
+                process.kill()
+                with contextlib.suppress(subprocess.SubprocessError):
+                    process.communicate()
+                raise RuntimeError(
+                    f"Command timed out after {timeout}s: {' '.join(cmd)}"
+                ) from exc
             if log_file is not None:
-                log_file.write(line)
+                log_file.write(stdout_data)
                 log_file.flush()
-            print(line, end="", flush=True)
-            if capture:
-                chunks.append(line)
-        returncode = process.wait()
-    output = "".join(chunks)
+            print(stdout_data, end="", flush=True)
+            returncode = process.returncode
+        output = stdout_data
+    else:
+        chunks: list[str] = []
+        with contextlib.ExitStack() as stack:
+            log_file = (
+                stack.enter_context(log_path.open("w", encoding="utf-8"))
+                if log_path
+                else None
+            )
+            process = subprocess.Popen(cmd, **popen_kwargs, bufsize=1)
+            assert process.stdout is not None
+            for line in process.stdout:
+                if log_file is not None:
+                    log_file.write(line)
+                    log_file.flush()
+                print(line, end="", flush=True)
+                if capture:
+                    chunks.append(line)
+            returncode = process.wait()
+        output = "".join(chunks)
     if returncode:
         raise RuntimeError(
             f"Command failed with exit code {returncode}: {' '.join(cmd)}"
@@ -864,6 +901,16 @@ def gguf_inventory(path: Path, llama_cpp_root: Path) -> dict[str, Any]:
             sys.path.remove(str(llama_cpp_root / "gguf-py"))
 
 
+def cli_oneshot_args(binary: Path) -> list[str]:
+    help_text = tool_help(binary)
+    if help_has(help_text, "--single-turn"):
+        return ["--single-turn"]
+    for flag in ("-no-cnv", "--no-conversation", "--no-cnv"):
+        if help_has(help_text, flag):
+            return [flag]
+    return []
+
+
 def smoke_load(binary: Path, weights: Path, prompt: str, log_path: Path) -> str:
     command = [
         binary,
@@ -888,11 +935,18 @@ def smoke_load(binary: Path, weights: Path, prompt: str, log_path: Path) -> str:
         str(getattr(config, "CACHE_TYPE_K", "q8_0")),
         "-ctv",
         str(getattr(config, "CACHE_TYPE_V", "q8_0")),
+        *cli_oneshot_args(binary),
     ]
     extra = getattr(config, "SMOKE_EXTRA_ARGS", ())
     if extra:
         command.extend(str(part) for part in extra)
-    return run(command, capture=True, log_path=log_path)
+    return run(
+        command,
+        capture=True,
+        log_path=log_path,
+        stdin=subprocess.DEVNULL,
+        timeout=float(getattr(config, "SMOKE_TIMEOUT", 300)),
+    )
 
 
 REQUIRED_SFT_CONFIG_KEYS = (
