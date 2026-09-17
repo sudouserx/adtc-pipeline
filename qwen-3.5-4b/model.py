@@ -412,7 +412,32 @@ def is_expected_loading_key(key: str) -> bool:
 
 
 def load_merge_base(revision: str) -> tuple[Any, Any]:
+    """Load the same Qwen architecture used during training.
+
+    The adapter target modules are generated against the Unsloth/FastModel module
+    layout, so reloading with the raw Transformers checkpoint path can produce a
+    different set of module names (for example, model.language_model.* vs
+    model.*). PEFT later rejects the saved target list because the names no longer
+    match the base model exactly. Prefer the same loader used in SFT and only fall
+    back to the raw HF loader if Unsloth is unavailable.
+    """
     import os
+
+    try:
+        import torch
+        from unsloth import FastModel
+
+        loaded, _ = FastModel.from_pretrained(
+            model_name=BASE_MODEL,
+            revision=revision,
+            max_seq_length=8192,
+            dtype=torch.bfloat16,
+            load_in_4bit=False,
+            load_in_16bit=True,
+        )
+        return loaded, {"missing_keys": [], "unexpected_keys": []}
+    except Exception:
+        pass
 
     import torch
     from transformers import AutoModelForCausalLM
