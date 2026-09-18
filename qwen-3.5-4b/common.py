@@ -274,7 +274,7 @@ def seed_everything(seed: int) -> None:
 
 def require_llama_cpp_build_tools() -> None:
     missing = [
-        name for name in ("cmake", "g++", "make") if shutil.which(name) is None
+        name for name in ("cmake", "g++", "make", "git") if shutil.which(name) is None
     ]
     if shutil.which("nvcc") is None:
         missing.append("nvcc")
@@ -349,6 +349,10 @@ def setup_llama_cpp() -> dict[str, Path]:
         actual = run(["git", "rev-parse", "HEAD"], cwd=checkout, capture=True).strip()
         if actual == config.LLAMA_CPP_COMMIT and qwen35_supported():
             return binaries
+        print(
+            "Existing llama.cpp checkout is stale or missing Qwen 3.5 support; rebuilding.",
+            flush=True,
+        )
     require_llama_cpp_build_tools()
     if not checkout.exists():
         run(["git", "clone", "https://github.com/ggml-org/llama.cpp.git", checkout])
