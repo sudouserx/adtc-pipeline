@@ -106,6 +106,7 @@ def merge_bf16(base_revision: str, merged: Path) -> dict:
     if missing:
         raise RuntimeError(f"Merged model is missing required files: {missing}")
     dtype_counts = inspect_safetensors_bf16(merged)
+    mtp_reconcile = model.reconcile_mtp_config(merged)
     del loaded, base
     gc.collect()
     torch.cuda.empty_cache()
@@ -115,6 +116,7 @@ def merge_bf16(base_revision: str, merged: Path) -> dict:
         "cast_to_bf16": cast_counts,
         "text_only": True,
         "hf_mtp_tensors": hf_mtp,
+        **mtp_reconcile,
     }
 
 
@@ -152,16 +154,14 @@ def main() -> int:
         )
     except RuntimeError as exc:
         converter_help = str(exc)
-    mtp_requested = False
-    if help_has(converter_help, "--mtp"):
-        try:
-            run([*convert_cmd, "--mtp"], cwd=llama_root, env=env)
-            mtp_requested = True
-        except RuntimeError:
-            dest.unlink(missing_ok=True)
-            run(convert_cmd, cwd=llama_root, env=env)
-    else:
-        run(convert_cmd, cwd=llama_root, env=env)
+    has_mtp = bool(merge_details.get("has_mtp"))
+    convert_args: list[str] = []
+    if not has_mtp:
+        if help_has(converter_help, "--no-mtp"):
+            convert_args = ["--no-mtp"]
+        elif help_has(converter_help, "--no-nextn"):
+            convert_args = ["--no-nextn"]
+    run([*convert_cmd, *convert_args], cwd=llama_root, env=env)
     inventory = gguf_inventory(dest, llama_root)
     tensor_types = {name.upper() for name in inventory["tensor_type_counts"]}
     forbidden_types = tensor_types - {"BF16", "F32"}
@@ -171,9 +171,10 @@ def main() -> int:
             f"{inventory['tensor_type_counts']}"
         )
     model.assert_text_only_gguf(inventory)
+    model.assert_gguf_mtp_consistency(inventory)
     mtp_tensors = model.mtp_tensor_names(inventory["tensors"])
-    hf_mtp = merge_details.get("hf_mtp_tensors") or []
-    if hf_mtp and not mtp_tensors:
+    if has_mtp and not mtp_tensors:
+        hf_mtp = merge_details.get("hf_mtp_tensors") or []
         raise RuntimeError(
             "Merged checkpoint has MTP/nextn tensors but the GGUF dropped them: "
             f"{hf_mtp[:20]}"
@@ -195,7 +196,7 @@ def main() -> int:
             "tensors": None,
             "text_only": True,
             "mmproj": False,
-            "mtp_requested": mtp_requested,
+            "mtp_included": has_mtp,
             "mtp_tensors": mtp_tensors,
         },
     )

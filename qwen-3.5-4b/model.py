@@ -663,20 +663,123 @@ def assert_text_only_gguf(inventory: dict[str, Any]) -> None:
         )
 
 
+EXPECTED_TRUNK_LAYERS = 32
+
+_MTP_NAME = re.compile(r"(?:^|[._])(?:mtp|draft|nextn)(?:[._]|$)", re.I)
+_GGUF_BLOCK = re.compile(r"^blk\.(\d+)\.")
+
+
 def mtp_tensor_names(tensors: dict[str, str]) -> list[str]:
-    return [
-        name
-        for name in tensors
-        if re.search(r"(?:^|[._])(?:mtp|draft|nextn)(?:[._]|$)", name, re.I)
-    ]
+    return [name for name in tensors if _MTP_NAME.search(name)]
 
 
 def hf_mtp_keys(keys: Iterable[str]) -> list[str]:
-    return [
-        name
-        for name in keys
-        if re.search(r"(?:^|[._])(?:mtp|nextn)(?:[._]|$)", name, re.I)
+    return [name for name in keys if _MTP_NAME.search(name)]
+
+
+def _local_checkpoint_keys(merged_dir: Path) -> set[str]:
+    index = merged_dir / "model.safetensors.index.json"
+    if index.is_file():
+        return set(json.loads(index.read_text(encoding="utf-8"))["weight_map"])
+    try:
+        from safetensors import safe_open
+    except ImportError as exc:
+        raise RuntimeError("safetensors is required to inspect merged checkpoints") from exc
+    keys: set[str] = set()
+    for path in sorted(merged_dir.glob("*.safetensors")):
+        with safe_open(str(path), framework="pt", device="cpu") as handle:
+            keys.update(handle.keys())
+    return keys
+
+
+def checkpoint_has_mtp_weights(keys: Iterable[str], num_hidden_layers: int) -> bool:
+    key_list = list(keys)
+    if hf_mtp_keys(key_list):
+        return True
+    layer_prefixes = (
+        rf"(?:^|\.)layers\.{num_hidden_layers}\.",
+        rf"(?:^|\.)language_model\.layers\.{num_hidden_layers}\.",
+        rf"^blk\.{num_hidden_layers}\.",
+    )
+    for key in key_list:
+        for pattern in layer_prefixes:
+            if re.search(pattern, key):
+                return True
+    return False
+
+
+def reconcile_mtp_config(
+    merged_dir: Path,
+    keys: Iterable[str] | None = None,
+) -> dict[str, Any]:
+    config_path = merged_dir / "config.json"
+    if not config_path.is_file():
+        raise RuntimeError(f"Missing {config_path}")
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    text_config = config.get("text_config")
+    num_hidden_layers = int(
+        (text_config or {}).get("num_hidden_layers")
+        or config.get("num_hidden_layers")
+        or EXPECTED_TRUNK_LAYERS
+    )
+    if keys is None:
+        keys = _local_checkpoint_keys(merged_dir)
+    has_mtp = checkpoint_has_mtp_weights(keys, num_hidden_layers)
+    patched: list[str] = []
+    if not has_mtp:
+        for target in (config, text_config):
+            if not isinstance(target, dict):
+                continue
+            if target.get("mtp_num_hidden_layers", 0):
+                target["mtp_num_hidden_layers"] = 0
+                patched.append("mtp_num_hidden_layers=0")
+        if patched:
+            config_path.write_text(
+                json.dumps(config, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+    return {
+        "has_mtp": has_mtp,
+        "num_hidden_layers": num_hidden_layers,
+        "patched_fields": patched,
+    }
+
+
+def gguf_max_block_index(tensors: dict[str, str]) -> int | None:
+    indices = [
+        int(match.group(1))
+        for name in tensors
+        if (match := _GGUF_BLOCK.match(name))
     ]
+    return max(indices) if indices else None
+
+
+def assert_gguf_mtp_consistency(inventory: dict[str, Any]) -> None:
+    tensors = inventory["tensors"]
+    nextn = int(inventory.get("nextn_predict_layers") or 0)
+    max_block = inventory.get("max_block_index")
+    if max_block is None:
+        max_block = gguf_max_block_index(tensors)
+    trunk_max = EXPECTED_TRUNK_LAYERS - 1
+    mtp_blocks = [
+        name
+        for name in tensors
+        if name.startswith(f"blk.{EXPECTED_TRUNK_LAYERS}.")
+    ]
+    mtp_named = mtp_tensor_names(tensors)
+    if nextn > 0:
+        if not mtp_blocks and not mtp_named:
+            raise RuntimeError(
+                "GGUF advertises nextn_predict_layers="
+                f"{nextn} but no MTP block tensors "
+                f"(blk.{EXPECTED_TRUNK_LAYERS}.* or nextn.*) were found."
+            )
+        return
+    if max_block is not None and max_block > trunk_max:
+        raise RuntimeError(
+            f"GGUF has blk.{max_block} tensors but nextn_predict_layers=0 "
+            "(metadata/weights mismatch; reconvert with --no-mtp)."
+        )
 
 
 def smoke_warnings(prompt_name: str, output: str) -> list[str]:

@@ -917,10 +917,23 @@ def gguf_inventory(path: Path, llama_cpp_root: Path) -> dict[str, Any]:
         field = reader.fields.get("general.architecture")
         if field is not None:
             architecture = str(field.parts[-1])
+        nextn_predict_layers = 0
+        for key, meta_field in reader.fields.items():
+            if key.endswith("nextn_predict_layers"):
+                nextn_predict_layers = int(meta_field.parts[-1])
+                break
+        block_indices = [
+            int(match.group(1))
+            for name in tensors
+            if (match := re.match(r"blk\.(\d+)\.", name))
+        ]
+        max_block_index = max(block_indices) if block_indices else None
         return {
             "size": path.stat().st_size,
             "sha256": sha256_file(path),
             "architecture": architecture,
+            "nextn_predict_layers": nextn_predict_layers,
+            "max_block_index": max_block_index,
             "tensor_type_counts": dict(counts),
             "tensors": tensors,
         }
@@ -969,13 +982,24 @@ def smoke_load(binary: Path, weights: Path, prompt: str, log_path: Path) -> str:
     extra = getattr(config, "SMOKE_EXTRA_ARGS", ())
     if extra:
         command.extend(str(part) for part in extra)
-    return run(
-        command,
-        capture=True,
-        log_path=log_path,
-        stdin=subprocess.DEVNULL,
-        timeout=float(getattr(config, "SMOKE_TIMEOUT", 300)),
-    )
+    try:
+        return run(
+            command,
+            capture=True,
+            log_path=log_path,
+            stdin=subprocess.DEVNULL,
+            timeout=float(getattr(config, "SMOKE_TIMEOUT", 300)),
+        )
+    except RuntimeError as exc:
+        hint = ""
+        if log_path.is_file():
+            log_text = log_path.read_text(encoding="utf-8", errors="replace")
+            if re.search(r"blk\.\d+\.attn_norm\.weight", log_text):
+                hint = (
+                    "\nHint: GGUF may advertise an MTP block but trunk-only tensors "
+                    "were converted; reconvert with --no-mtp."
+                )
+        raise RuntimeError(str(exc) + hint) from exc
 
 
 REQUIRED_SFT_CONFIG_KEYS = (

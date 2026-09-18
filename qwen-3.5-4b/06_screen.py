@@ -78,7 +78,9 @@ def _probe_mtp(binaries: dict[str, Path], dest: Path) -> dict:
         "bench_has_spec_type": help_has(bench_help, "--spec-type"),
         "bench_has_spec_draft_n_max": help_has(bench_help, "--spec-draft-n-max"),
         "bench_has_draft_max": help_has(bench_help, "--draft-max"),
-        "reference_mtp_requested": bool(reference.get("mtp_requested")),
+        "reference_mtp_included": bool(
+            reference.get("mtp_included", reference.get("mtp_requested"))
+        ),
         "reference_mtp_tensors": mtp_tensors or reference.get("mtp_tensors") or [],
         "speculative_args": [],
         "speculative_enabled": False,
