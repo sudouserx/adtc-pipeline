@@ -6,7 +6,7 @@ Data is already on Hub (`kuzaai/kuza_sft_*`). To rebuild it, see `data/`.
 
 ## Train
 
-Needs a CUDA GPU, `HF_TOKEN` (read datasets, write model repos), and a lean copy of this repo (scripts only; no `data/final/*.jsonl`).
+Needs a CUDA GPU, `HF_TOKEN` (read datasets, write model repos), and a lean copy of this repo (scripts only; no `data/final/*.jsonl`). Screening (`06_screen.py`) also needs the repo root — `experiments/eval_hidden.py` and `data/hidden_prompts.jsonl` — not just the `gemma-4-e2b/` or `qwen-3.5-4b/` subdirectory alone.
 
 ```bash
 export HF_TOKEN=hf_...
@@ -20,9 +20,9 @@ export KUZA_WORK_DIR=/workspace/kuza-pipeline
 cd gemma-4-e2b && bash run.sh   # or: cd qwen-3.5-4b && bash run.sh
 ```
 
-`run.sh` runs install → llama.cpp → SFT → merge → imatrix → quants → screen → provenance → Hub upload.
-Skip upload with `KUZA_SKIP_UPLOAD=1`. Override repos with `KUZA_UPLOAD_REPO`.
-Local JSONL instead of Hub: `KUZA_LOCAL_DATA=/path/to/data/final`.
+`run.sh` runs install → llama.cpp → SFT → DPO → merge → QAT export → imatrix → quants → screen → provenance → Hub upload.
+Skip upload with `KUZA_SKIP_UPLOAD=1`. Skip DPO with `KUZA_SKIP_DPO=1` or `KUZA_DPO_ENABLED=0`. Skip QAT export with `KUZA_SKIP_QAT_EXPORT=1`.
+Override repos with `KUZA_UPLOAD_REPO`. Local JSONL instead of Hub: `KUZA_LOCAL_DATA=/path/to/data/final` (put `preference.jsonl` there for DPO).
 
 Artifacts: `$KUZA_WORK_DIR/kuza-gemma-4-e2b/` or `.../kuza-qwen-3.5-4b/`. Model repos are created on upload if missing.
 

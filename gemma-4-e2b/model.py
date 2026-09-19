@@ -47,6 +47,11 @@ MIX = {
     "eval_group_max": 500,
 }
 
+import config as _config
+
+DATASETS = _config.DATASETS
+MIX = _config.MIX
+
 CHAT_TEMPLATE_NAME = "gemma-4"
 INSTRUCTION_PART = "<|turn>user\n"
 RESPONSE_PART = "<|turn>model\n"

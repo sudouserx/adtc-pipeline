@@ -1,4 +1,29 @@
 #!/usr/bin/env bash
+# =============================================================================
+# run.sh — one-shot orchestration for the Kuza Gemma 4 E2B pipeline
+#
+# Pipeline order:
+#   preflight -> deps -> llama.cpp -> SFT -> DPO -> merge -> QAT export
+#   -> imatrix -> quants -> screen -> provenance -> upload
+#
+# Knobs (all optional; see config.py for the full list):
+#   HF_TOKEN             required — Hugging Face write token
+#   KUZA_WORK_DIR        run root          (default /workspace/kuza-pipeline)
+#   KUZA_LOCAL_DATA      dir of local {source}.jsonl overrides; put
+#                        preference.jsonl here to use a local preference set
+#   KUZA_UPLOAD_REPO     target HF repo    (default kuzaai/kuza-gemma-4-e2b)
+#   KUZA_LR / KUZA_TRAIN_SEQ / KUZA_EPOCHS        SFT overrides
+#   KUZA_DPO_DATASET     preference repo   (default kuzaai/kuza_dpo_preference
+#                        — uploaded MANUALLY by the owner; never pushed here)
+#   KUZA_SKIP_DPO=1      skip preference alignment (adapter/ stays pure SFT)
+#   KUZA_DPO_ENABLED=0   same as KUZA_SKIP_DPO (config.DPO["enabled"])
+#   KUZA_FORCE_DPO=1     retrain DPO even if adapter-dpo/ exists
+#   KUZA_REQUIRE_DPO=1   missing preference dataset -> hard error
+#   KUZA_SKIP_UPLOAD=1   stop after provenance, no HF upload
+#   KUZA_SKIP_QAT_EXPORT=1  skip QAT lattice export (05_quants skips q4_0_qat_export)
+#   KUZA_DRY_RUN=1       08_upload.py lists+hashes only, uploads nothing
+#   KUZA_CALIB_TOKENS / KUZA_KLD_CHUNKS / KUZA_EDGE_THREADS   screening knobs
+# =============================================================================
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -36,6 +61,9 @@ if config.LOCAL_DATA_DIR is not None:
             print(f"preflight: local {key} <- {path}")
         else:
             print(f"preflight: local {key} missing; will use Hub")
+    pref = config.LOCAL_DATA_DIR / "preference.jsonl"
+    if pref.is_file() and pref.stat().st_size > 0:
+        print(f"preflight: local preference pairs <- {pref}")
 else:
     leftover = Path(config.__file__).resolve().parents[1] / "data" / "cleaned"
     found = sorted(
@@ -49,19 +77,62 @@ else:
             "ignored unless KUZA_LOCAL_DATA is set"
         )
 
+dpo_disabled = (
+    os.environ.get("KUZA_SKIP_DPO") == "1"
+    or not config.DPO.get("enabled", True)
+)
+if dpo_disabled:
+    reason = "KUZA_SKIP_DPO=1" if os.environ.get("KUZA_SKIP_DPO") == "1" else "KUZA_DPO_ENABLED=0"
+    print(f"preflight: DPO disabled ({reason})")
+else:
+    pref_local = None
+    if config.LOCAL_DATA_DIR is not None:
+        candidate = config.LOCAL_DATA_DIR / "preference.jsonl"
+        if candidate.is_file() and candidate.stat().st_size > 0:
+            pref_local = candidate
+    if pref_local is not None:
+        print(f"preflight: preference pairs <- {pref_local}")
+    else:
+        print(
+            "preflight: preference pairs <- "
+            f"{config.DPO_DATASET} (Hub, uploaded manually by the repo owner)"
+        )
+        print(
+            "preflight: WARNING: no local preference.jsonl; 02b_dpo will load "
+            "from Hub after deps install or skip if unavailable"
+        )
+        if os.environ.get("KUZA_REQUIRE_DPO") == "1":
+            sys.exit(
+                "KUZA_REQUIRE_DPO=1 but preference.jsonl is missing from "
+                "KUZA_LOCAL_DATA; set it before starting or unset KUZA_REQUIRE_DPO"
+            )
+
 print("preflight: ok")
 PY
 
 python 00_install_deps.py
 python 01_setup_llama_cpp.py
+
 python 02_sft.py
+
+python 02b_dpo.py  # preference alignment; trains from the frozen SFT snapshot,
+                   # then promotes the policy into adapter/ for stages 03-08
+
 python 03_reference.py
+if [ "${KUZA_SKIP_QAT_EXPORT:-}" != "1" ]; then
+  python 03b_qat_export.py
+fi
 python 04_imatrix.py
 python 05_quants.py
-python 06_screen.py  # hidden-set rank; KLD diagnostic; GPU TPS is not ADTC
+python 06_screen.py  # hidden-set rank; KLD diagnostic; CPU bench arm is the edge signal
 python 07_provenance.py
+
 if [ "${KUZA_SKIP_UPLOAD:-}" = "1" ]; then
   echo "upload: skipped (KUZA_SKIP_UPLOAD=1)"
 else
-  python 08_upload.py
+  if [ "${KUZA_DRY_RUN:-}" = "1" ]; then
+    python 08_upload.py --dry-run
+  else
+    python 08_upload.py
+  fi
 fi
