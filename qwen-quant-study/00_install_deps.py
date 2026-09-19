@@ -4,20 +4,11 @@
 from __future__ import annotations
 
 import sys
-from pathlib import Path
 
-import config
+import study_config
+from pipeline_env import bootstrap_pipeline
 
-PIPELINE = config.PIPELINE_DIR
-if str(PIPELINE) not in sys.path:
-    sys.path.insert(0, str(PIPELINE))
-
-import config as pipeline_config  # noqa: E402
-
-pipeline_config.WORK_DIR = Path(
-    __import__("os").environ.get("KUZA_WORK_DIR", "/workspace/kuza-pipeline")
-)
-pipeline_config.TOOLS_DIR = config.TOOLS_DIR
+pipeline_config = bootstrap_pipeline(study_config)
 
 from common import (  # noqa: E402
     package_version,

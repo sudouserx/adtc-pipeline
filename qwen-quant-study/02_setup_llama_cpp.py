@@ -3,20 +3,10 @@
 
 from __future__ import annotations
 
-import os
-import sys
-from pathlib import Path
+import study_config
+from pipeline_env import bootstrap_pipeline
 
-import config
-
-if str(config.PIPELINE_DIR) not in sys.path:
-    sys.path.insert(0, str(config.PIPELINE_DIR))
-
-import config as pipeline_config  # noqa: E402
-
-pipeline_config.WORK_DIR = Path(os.environ.get("KUZA_WORK_DIR", "/workspace/kuza-pipeline"))
-pipeline_config.TOOLS_DIR = config.TOOLS_DIR
-pipeline_config.LLAMA_CPP_COMMIT = config.LLAMA_CPP_COMMIT
+bootstrap_pipeline(study_config)
 
 from common import setup_llama_cpp  # noqa: E402
 

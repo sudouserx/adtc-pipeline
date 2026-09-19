@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-import config
+import study_config as config
 import paths
 import quant_specs
 from study_common import (

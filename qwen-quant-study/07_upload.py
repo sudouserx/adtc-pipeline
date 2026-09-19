@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-import config
+import study_config as config
 import quant_specs
 from study_common import hf_token, read_json, sha256_file, write_json
 

@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import config
+import study_config as config
 from study_common import read_json, write_json
 
 

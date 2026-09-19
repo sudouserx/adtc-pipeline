@@ -3,14 +3,11 @@
 from __future__ import annotations
 
 import os
-import sys
-from pathlib import Path
 
-import config
+import study_config
+from pipeline_env import bootstrap_pipeline
 
-# Import pipeline modules read-only.
-if str(config.PIPELINE_DIR) not in sys.path:
-    sys.path.insert(0, str(config.PIPELINE_DIR))
+bootstrap_pipeline(study_config)
 
 import model as pipeline_model  # noqa: E402
 from common import (  # noqa: E402
@@ -35,22 +32,11 @@ from common import (  # noqa: E402
     pytorch_index_url,
 )
 
-# Patch pipeline config so llama.cpp tools resolve under shared TOOLS_DIR.
-import config as pipeline_config  # noqa: E402
-
-pipeline_config.WORK_DIR = Path(os.environ.get("KUZA_WORK_DIR", "/workspace/kuza-pipeline"))
-pipeline_config.TOOLS_DIR = config.TOOLS_DIR
-pipeline_config.MAX_SEQ_LENGTH = config.MAX_SEQ_LENGTH
-pipeline_config.SEED = config.SEED
-pipeline_config.FLASH_ATTN = config.FLASH_ATTN
-pipeline_config.CACHE_TYPE_K = config.CACHE_TYPE_K
-pipeline_config.CACHE_TYPE_V = config.CACHE_TYPE_V
-
 
 def configure_hf_cache() -> None:
-    config.HF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    os.environ.setdefault("HF_HOME", str(config.HF_CACHE_DIR))
-    os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(config.HF_CACHE_DIR / "hub"))
+    study_config.HF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("HF_HOME", str(study_config.HF_CACHE_DIR))
+    os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(study_config.HF_CACHE_DIR / "hub"))
 
 
 def hf_token() -> str:
@@ -62,17 +48,17 @@ def hf_token() -> str:
 
 
 def load_tokenizer():
-    return pipeline_model.load_tokenizer(config.ARTIFACTS_DIR / "adapter")
+    return pipeline_model.load_tokenizer(study_config.ARTIFACTS_DIR / "adapter")
 
 
 def runtime_flags() -> list[str]:
     return [
         "-fa",
-        str(config.FLASH_ATTN),
+        str(study_config.FLASH_ATTN),
         "-ctk",
-        str(config.CACHE_TYPE_K),
+        str(study_config.CACHE_TYPE_K),
         "-ctv",
-        str(config.CACHE_TYPE_V),
+        str(study_config.CACHE_TYPE_V),
     ]
 
 

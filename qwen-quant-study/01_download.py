@@ -7,7 +7,7 @@ import json
 import urllib.request
 from pathlib import Path
 
-import config
+import study_config as config
 import paths
 from study_common import hf_token, require_file, sha256_file, write_json
 

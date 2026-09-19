@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import config
+import study_config as config
 
 
 def artifacts() -> Path:
