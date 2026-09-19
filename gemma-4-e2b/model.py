@@ -337,15 +337,20 @@ def text_tokenizer(obj: Any) -> Any:
 
 def encode_ids(obj: Any, text: str) -> list[int]:
     tokenizer = text_tokenizer(obj)
-    encoded = tokenizer(text, add_special_tokens=False)
-    ids = encoded["input_ids"] if isinstance(encoded, dict) else encoded
+    if hasattr(tokenizer, "encode"):
+        ids = tokenizer.encode(text, add_special_tokens=False)
+    else:
+        encoded = tokenizer(text, add_special_tokens=False)
+        ids = encoded["input_ids"] if hasattr(encoded, "__getitem__") else encoded
+    if hasattr(ids, "tolist"):
+        ids = ids.tolist()
     if ids and isinstance(ids[0], list):
         ids = ids[0]
-    return list(ids)
+    return [int(x) for x in ids]
 
 
 def decode_ids(obj: Any, ids: list[int]) -> str:
-    return text_tokenizer(obj).decode(ids, skip_special_tokens=False)
+    return text_tokenizer(obj).decode([int(x) for x in ids], skip_special_tokens=False)
 
 
 def apply_chat_template(tokenizer: Any) -> Any:

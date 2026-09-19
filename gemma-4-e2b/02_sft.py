@@ -251,20 +251,25 @@ def random_shuffle(rows: list[dict]) -> None:
 def _termination_ids(tokenizer) -> list[int]:
     """Ids that must terminate every kept example: <end_of_turn> then <eos>.
 
-    Resolved via the vocab (not attributes): HF tokenizers expose
+    Resolved via convert_tokens_to_ids (not attributes): HF tokenizers expose
     ``eos_token`` but not ``end_of_turn_token``, while Gemma chat turns end
     with <end_of_turn>.
     """
-    vocab = tokenizer.get_vocab()
+    tokenizer = model.text_tokenizer(tokenizer)
+    unk = getattr(tokenizer, "unk_token_id", None)
     candidates = ["<end_of_turn>", "<eos>"]
     eos = getattr(tokenizer, "eos_token", None)
     if eos and eos not in candidates:
         candidates.append(eos)
     ids: list[int] = []
     for token in candidates:
-        token_id = vocab.get(token)
-        if token_id is not None and token_id not in ids:
-            ids.append(token_id)
+        if not token or isinstance(token, int):
+            token_id = int(token) if isinstance(token, int) else None
+        else:
+            token_id = tokenizer.convert_tokens_to_ids(token)
+        if token_id is None or token_id == unk or token_id in ids:
+            continue
+        ids.append(int(token_id))
     return ids
 
 
