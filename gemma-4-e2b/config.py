@@ -65,7 +65,7 @@ GRAD_ACCUMULATION = 1                                          # [ORIG]
 # eval loss was still falling at its final step. Reproduce the old behaviour
 # with KUZA_LR=2e-5.
 LEARNING_RATE = float(os.environ.get("KUZA_LR", "1e-4"))
-LR_SCHEDULER = "cosine_with_warmup"                            # [NEW]
+LR_SCHEDULER = "cosine"                                        # [NEW] warmup via WARMUP_RATIO
 WARMUP_RATIO = 0.03                                            # [NEW]
 WEIGHT_DECAY = 0.01                                            # [NEW]
 # [NEW] eval cadence + early stop (original: 4 eval points per whole run —

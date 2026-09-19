@@ -13,7 +13,7 @@ REPLACEMENT (review 2026-09). Changes vs original 02_sft.py:
      re-appended (the original could train EOS-less suffixes, teaching the
      model to stop mid-sentence without a stop token).
   4. Training config from the new config knobs: LoRA-appropriate LR 1e-4,
-     cosine_with_warmup, 4 evals/epoch, patience 4, threshold 1e-4.
+     cosine + warmup_ratio, 4 evals/epoch, patience 4, threshold 1e-4.
   5. New optional mix sources: swahili_native, code_switch, grounding
      (graceful degradation with warnings; recorded in the manifest).
 """
