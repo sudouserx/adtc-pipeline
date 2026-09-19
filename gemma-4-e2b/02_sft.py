@@ -102,9 +102,6 @@ def train_only_keys(rows: list[dict]) -> set[str]:
 # Data mixing with per-source splits BEFORE mixing (review F2.1 / F5)
 # ---------------------------------------------------------------------------
 
-OPTIONAL_SOURCES = ("swahili_native", "code_switch", "grounding")
-
-
 def load_training_rows_split(
     dataset_revisions: dict[str, str],
 ) -> tuple[list[dict], list[dict], list[dict], dict]:
@@ -118,7 +115,11 @@ def load_training_rows_split(
     def load(key: str, language: str, filename: str) -> list[dict]:
         if key not in model.DATASETS:
             return []
-        return load_local_or_hub(key, language, filename, dataset_revisions)
+        optional = key in config.SFT_OPTIONAL_SOURCES
+        hub_fallback = (not optional) or (key in dataset_revisions)
+        return load_local_or_hub(
+            key, language, filename, dataset_revisions, hub_fallback=hub_fallback
+        )
 
     pools: dict[str, tuple[list[dict], list[dict]]] = {}
     for key in ("english", "swahili", "general", "adversarial", "multiturn"):
@@ -150,7 +151,7 @@ def load_training_rows_split(
         )
         pools[key] = split_rows(rows, fraction, config.SEED) if rows else ([], [])
 
-    for key in OPTIONAL_SOURCES:
+    for key in config.SFT_OPTIONAL_SOURCES:
         rows = load(key, "swahili" if key == "swahili_native" else "english", f"{key}.jsonl")
         if not rows:
             warnings.append(f"optional source '{key}' empty; proceeding without it")
@@ -196,9 +197,9 @@ def load_training_rows_split(
         *deterministic_sample(adv_train, adversarial_target, config.SEED + 3),
         *deterministic_sample(mt_train, multiturn_target, config.SEED + 10),
     ]
-    for key in OPTIONAL_SOURCES:
+    for key in config.SFT_OPTIONAL_SOURCES:
         fraction_key = {
-            "swahili_native": "swahili_of_english",
+            "swahili_native": "swahili_native_of_english",
             "code_switch": "code_switch_of_english",
             "grounding": "grounding_of_english",
         }[key]

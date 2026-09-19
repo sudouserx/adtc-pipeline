@@ -393,11 +393,15 @@ def resolve_base_revision() -> str:
 
 def resolve_dataset_revisions() -> dict[str, str]:
     from huggingface_hub import HfApi
+    from huggingface_hub.errors import RepositoryNotFoundError
 
     api = HfApi(token=hf_token())
     revisions: dict[str, str] = {}
     seen: dict[str, str] = {}
-    for key, repo in model.DATASETS.items():
+    optional = set(config.SFT_OPTIONAL_SOURCES)
+    sft_keys = (*config.SFT_REQUIRED_SOURCES, *config.SFT_OPTIONAL_SOURCES)
+    for key in sft_keys:
+        repo = model.DATASETS[key]
         root = config.LOCAL_DATA_DIR
         if root is not None:
             local = root / f"{key}.jsonl"
@@ -407,7 +411,19 @@ def resolve_dataset_revisions() -> dict[str, str]:
         if repo in seen:
             revisions[key] = seen[repo]
             continue
-        sha = api.dataset_info(repo, revision="main", token=hf_token()).sha
+        try:
+            sha = api.dataset_info(repo, revision="main", token=hf_token()).sha
+        except RepositoryNotFoundError:
+            if key in optional:
+                print(
+                    f"optional dataset '{key}' not on Hub ({repo}); proceeding without it",
+                    flush=True,
+                )
+                continue
+            raise RuntimeError(
+                f"Required dataset '{key}' not found on Hub: {repo}. "
+                "Push the JSONL or set KUZA_LOCAL_DATA."
+            ) from None
         seen[repo] = sha
         revisions[key] = sha
     return revisions

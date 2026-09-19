@@ -50,17 +50,24 @@ if missing:
         "apt-get update && apt-get install -y cmake g++ make git"
     )
 
-for key, repo in model.DATASETS.items():
-    print(f"preflight: {key} <- {repo}")
+for key in config.SFT_REQUIRED_SOURCES:
+    print(f"preflight: required {key} <- {model.DATASETS[key]}")
+for key in config.SFT_OPTIONAL_SOURCES:
+    print(
+        f"preflight: optional {key} <- {model.DATASETS[key]} "
+        "(skipped unless local JSONL or Hub repo exists)"
+    )
 
 if config.LOCAL_DATA_DIR is not None:
     print(f"preflight: KUZA_LOCAL_DATA={config.LOCAL_DATA_DIR}")
-    for key in model.DATASETS:
+    for key in (*config.SFT_REQUIRED_SOURCES, *config.SFT_OPTIONAL_SOURCES):
         path = config.LOCAL_DATA_DIR / f"{key}.jsonl"
         if path.is_file() and path.stat().st_size > 0:
             print(f"preflight: local {key} <- {path}")
-        else:
+        elif key in config.SFT_REQUIRED_SOURCES:
             print(f"preflight: local {key} missing; will use Hub")
+        else:
+            print(f"preflight: local {key} missing; optional source will be skipped")
     pref = config.LOCAL_DATA_DIR / "preference.jsonl"
     if pref.is_file() and pref.stat().st_size > 0:
         print(f"preflight: local preference pairs <- {pref}")

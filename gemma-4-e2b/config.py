@@ -87,6 +87,8 @@ MAX_TRUNCATED_FRACTION = 0.10                                  # [ORIG]
 DATASETS = {
     "english": os.environ.get("KUZA_EN_DATASET", "kuzaai/kuza_sft_english"),
     "swahili": os.environ.get("KUZA_SW_DATASET", "kuzaai/kuza_sft_swahili"),
+    # Optional — Hub repos are placeholders until uploaded; use KUZA_LOCAL_DATA
+    # or override KUZA_*_DATASET when a repo becomes available.
     "swahili_native": os.environ.get("KUZA_SW_NATIVE_DATASET", "kuzaai/kuza_sft_swahili_native"),
     "code_switch": os.environ.get("KUZA_CS_DATASET", "kuzaai/kuza_sft_code_switch"),
     "grounding": os.environ.get("KUZA_GROUND_DATASET", "kuzaai/kuza_sft_grounding"),
@@ -102,6 +104,7 @@ MIX = {
     "general_of_english": 0.08,
     "adversarial_of_english": 0.05,      # [FIX] archived run had ~117 rows (0.34%)
     "multiturn_of_english": 0.03,
+    "swahili_native_of_english": 0.0,    # future; enable when Hub repo exists
     "code_switch_of_english": 0.10,      # [NEW] Sw-En mixed queries (deployment-real)
     "grounding_of_english": 0.06,        # [NEW] passage-grounded QA (anti-hallucination)
     "agri_eval_fraction": 0.05,
@@ -110,6 +113,20 @@ MIX = {
     "general_max_response_words": 250,
     "eval_group_max": 500,
 }
+
+# SFT dataset roles — only SFT_REQUIRED_SOURCES are resolved from Hub by default.
+SFT_REQUIRED_SOURCES = (
+    "english",
+    "swahili",
+    "general",
+    "adversarial",
+    "multiturn",
+)
+SFT_OPTIONAL_SOURCES = (
+    "swahili_native",
+    "code_switch",
+    "grounding",
+)
 
 # Sources that must have a train/eval split BEFORE mixing (leakage fix). [NEW]
 SPLIT_SOURCES = ("english", "swahili", "swahili_native", "code_switch",
