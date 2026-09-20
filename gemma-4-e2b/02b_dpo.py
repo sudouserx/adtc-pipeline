@@ -44,9 +44,10 @@ import inspect
 import json
 import os
 from collections import Counter
+from contextlib import contextmanager
 from inspect import Parameter
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import config
 import model
@@ -463,6 +464,178 @@ def verify_dpo_hparams(
     return routing
 
 
+class _DPOTextProcessingShim:
+    """Unsloth VLM DPO row expects processing_class.tokenizer even for text-only data."""
+
+    def __init__(self, tokenizer: Any) -> None:
+        self.tokenizer = tokenizer
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.tokenizer, name)
+
+
+def _is_processor(obj: Any) -> bool:
+    try:
+        from transformers import ProcessorMixin
+    except ImportError:
+        return False
+    return isinstance(obj, ProcessorMixin)
+
+
+def _is_plain_tokenizer(obj: Any) -> bool:
+    try:
+        from transformers import PreTrainedTokenizerBase
+    except ImportError:
+        return False
+    return isinstance(obj, PreTrainedTokenizerBase) and not _is_processor(obj)
+
+
+def _is_vlm_model(model: Any) -> bool:
+    model_config = getattr(model, "config", None)
+    if model_config is None:
+        return False
+    model_type = str(getattr(model_config, "model_type", "")).lower()
+    if model_type in {"gemma4", "gemma3"}:
+        return True
+    if model_type:
+        try:
+            from transformers.models.auto.modeling_auto import (
+                MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES,
+            )
+
+            if model_type in {name.lower() for name in MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES}:
+                return True
+        except ImportError:
+            pass
+    class_name = model.__class__.__name__.lower()
+    return "gemma4" in class_name or "imagetext" in class_name
+
+
+def resolve_dpo_processing_kwarg(
+    model: Any,
+    tokenizer: Any,
+    trainer_cls: type,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    trainer_parameters = inspect.signature(trainer_cls).parameters
+    metadata = {
+        "tokenizer_class": type(tokenizer).__name__,
+        "shim_used": False,
+        "model_type": getattr(getattr(model, "config", None), "model_type", None),
+        "text_config_model_type": getattr(
+            getattr(getattr(model, "config", None), "text_config", None),
+            "model_type",
+            None,
+        ),
+        "route": "unknown",
+    }
+    if _is_processor(tokenizer):
+        metadata["route"] = "processing_class_processor"
+        if "processing_class" in trainer_parameters:
+            return {"processing_class": tokenizer}, metadata
+        if "tokenizer" in trainer_parameters:
+            return {"tokenizer": getattr(tokenizer, "tokenizer", tokenizer)}, metadata
+        raise RuntimeError("DPOTrainer accepts neither processing_class nor tokenizer")
+
+    if _is_plain_tokenizer(tokenizer) and _is_vlm_model(model):
+        metadata["shim_used"] = True
+        metadata["route"] = "processing_class_shim"
+        print(
+            "dpo: processing_class shim for VLM text-only DPO",
+            flush=True,
+        )
+        shim = _DPOTextProcessingShim(tokenizer)
+        if "processing_class" in trainer_parameters:
+            return {"processing_class": shim}, metadata
+        if "tokenizer" in trainer_parameters:
+            return {"tokenizer": tokenizer}, metadata
+        raise RuntimeError("DPOTrainer accepts neither processing_class nor tokenizer")
+
+    metadata["route"] = "processing_class_tokenizer"
+    if "processing_class" in trainer_parameters:
+        return {"processing_class": tokenizer}, metadata
+    if "tokenizer" in trainer_parameters:
+        return {"tokenizer": tokenizer}, metadata
+    raise RuntimeError("DPOTrainer accepts neither processing_class nor tokenizer")
+
+
+@contextmanager
+def _dpo_text_only_model_type(model: Any) -> Iterator[None]:
+    model_config = getattr(model, "config", None)
+    if model_config is None:
+        yield
+        return
+    original = getattr(model_config, "model_type", None)
+    text_type = getattr(getattr(model_config, "text_config", None), "model_type", None)
+    if text_type and original and original != text_type:
+        model_config.model_type = text_type
+        try:
+            yield
+        finally:
+            model_config.model_type = original
+        return
+    yield
+
+
+def apply_dpo_warmup_steps(
+    kwargs: dict[str, Any],
+    config_cls: type,
+    *,
+    steps_per_epoch: int,
+    num_train_epochs: float,
+) -> dict[str, Any]:
+    parameters = inspect.signature(config_cls).parameters
+    warmup_ratio = kwargs.get("warmup_ratio")
+    if warmup_ratio is None or "warmup_steps" not in parameters:
+        return kwargs
+    updated = dict(kwargs)
+    total_steps = max(1, int(steps_per_epoch * num_train_epochs))
+    updated["warmup_steps"] = max(1, int(total_steps * float(warmup_ratio)))
+    updated.pop("warmup_ratio", None)
+    return updated
+
+
+def _dpo_tokenizer_from_processing(processing_class: Any) -> Any:
+    inner = getattr(processing_class, "tokenizer", None)
+    return inner if inner is not None else processing_class
+
+
+def smoke_check_dpo_tokenization(
+    trainer: Any,
+    train_pairs: list[dict[str, str]],
+    processing_metadata: dict[str, Any],
+) -> None:
+    if not train_pairs:
+        raise RuntimeError("DPO smoke check requires at least one train pair")
+    processing_class = getattr(trainer, "processing_class", None)
+    if processing_class is None:
+        raise RuntimeError("DPO smoke check requires trainer.processing_class")
+    tokenizer = _dpo_tokenizer_from_processing(processing_class)
+    row = train_pairs[0]
+    failures: list[str] = []
+    for key in ("prompt", "chosen", "rejected"):
+        text = str(row.get(key, "")).strip()
+        if not text:
+            failures.append(f"{key}: empty")
+            continue
+        try:
+            encoded = tokenizer(text, add_special_tokens=False)
+            input_ids = encoded["input_ids"] if isinstance(encoded, dict) else encoded
+            if hasattr(input_ids, "tolist"):
+                input_ids = input_ids.tolist()
+            if isinstance(input_ids, list) and input_ids and isinstance(input_ids[0], list):
+                input_ids = input_ids[0]
+            if not input_ids:
+                failures.append(f"{key}: zero-length input_ids")
+        except Exception as exc:  # noqa: BLE001 - surface tokenizer failures early
+            failures.append(f"{key}: {exc!r}")
+    if failures:
+        raise RuntimeError(
+            "DPO tokenization smoke check failed: "
+            f"{failures}; processing={processing_metadata}"
+        )
+    print("dpo: tokenization smoke check passed", flush=True)
+
+
 def json_load(path: Path) -> dict[str, Any]:
     return dict(json.loads(path.read_text(encoding="utf-8")))
 
@@ -646,6 +819,12 @@ def main() -> int:
         "report_to": "none",
         "dataset_num_proc": min(8, os.cpu_count() or 1),
     }
+    dpo_config_kwargs = apply_dpo_warmup_steps(
+        dpo_config_kwargs,
+        DPOConfig,
+        steps_per_epoch=steps_per_epoch,
+        num_train_epochs=config.DPO_EPOCHS,
+    )
     dpo_intended = dict(dpo_config_kwargs)
     config_kwargs, trainer_dpo_kwargs, overflow_routing = split_dpo_kwargs(
         dpo_config_kwargs,
@@ -662,13 +841,16 @@ def main() -> int:
         "args": dpo_args,
         **trainer_dpo_kwargs,
     }
-    trainer_parameters = inspect.signature(DPOTrainer).parameters
-    if "processing_class" in trainer_parameters:
-        trainer_kwargs["processing_class"] = tokenizer
-    else:
-        trainer_kwargs["tokenizer"] = tokenizer
-    trainer = DPOTrainer(**trainer_kwargs)
+    processing_kwargs, processing_metadata = resolve_dpo_processing_kwarg(
+        loaded,
+        tokenizer,
+        DPOTrainer,
+    )
+    trainer_kwargs.update(processing_kwargs)
+    with _dpo_text_only_model_type(loaded):
+        trainer = DPOTrainer(**trainer_kwargs)
     dpo_routing = verify_dpo_hparams(dpo_args, trainer, dpo_intended, overflow_routing)
+    smoke_check_dpo_tokenization(trainer, train_pairs, processing_metadata)
 
     result = trainer.train()
     best = trainer.state.best_model_checkpoint
@@ -723,6 +905,7 @@ def main() -> int:
                 if key in DPO_MANIFEST_KEYS
             },
             "hyperparameter_routing": dpo_routing,
+            "processing": processing_metadata,
             "train_pairs": len(train_pairs),
             "eval_pairs": len(eval_pairs),
             "system_prompt_sha256": sha256_bytes(model.SYSTEM_PROMPT.encode()),
