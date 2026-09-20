@@ -163,15 +163,26 @@ def _drop_modality_towers(loaded) -> list[str]:
 def _is_language_linear(name: str) -> bool:
     if "language_model" not in name:
         return False
-    leaf = name.removesuffix(".linear").rsplit(".", 1)[-1]
+
+    module_name = name.rsplit(".", 1)[0]
+
+    # Support both plain nn.Linear and wrapped ...q_proj.linear modules.
+    if module_name.endswith(".linear"):
+        module_name = module_name[:-len(".linear")]
+
+    leaf = module_name.rsplit(".", 1)[-1]
     return leaf in LINEAR_SUFFIXES
 
 
 def _is_embedding(name: str) -> bool:
-    leaf = name.rsplit(".", 1)[-1]
+    if "language_model" not in name:
+        return False
+
+    module_name = name.rsplit(".", 1)[0]
+    leaf = module_name.rsplit(".", 1)[-1]
+
     return (
         leaf in EMBED_SUFFIXES
-        and "language_model" in name
         and not model.SHARED_KV_STATE.search(name + ".")
     )
 
