@@ -826,6 +826,21 @@ def cast_floating_to_bf16(loaded: Any) -> dict[str, int]:
     return dict(changed)
 
 
+def cast_lora_to_bf16(loaded: Any) -> dict[str, int]:
+    import torch
+
+    changed: Counter[str] = Counter()
+    for name, parameter in loaded.named_parameters():
+        if (
+            "lora_" in name
+            and parameter.is_floating_point()
+            and parameter.dtype != torch.bfloat16
+        ):
+            changed[str(parameter.dtype)] += 1
+            parameter.data = parameter.data.to(torch.bfloat16)
+    return dict(changed)
+
+
 def adapter_weight_files(directory: Path) -> list[Path]:
     files = sorted(directory.glob("adapter_model*.safetensors"))
     if not files:

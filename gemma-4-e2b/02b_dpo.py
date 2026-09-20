@@ -52,6 +52,7 @@ from common import (
     adapter_dir,
     assert_adapter_tensors_loaded,
     assert_model_bf16,
+    cast_lora_to_bf16,
     checkpoint_weight_keys,
     hf_token,
     preserve_best_checkpoint,
@@ -314,6 +315,12 @@ def main() -> int:
     )
     tokenizer = model.apply_chat_template(tokenizer)
     kv_patch = model.patch_kv_sharing(loaded)
+    cast_counts = cast_lora_to_bf16(loaded)
+    if cast_counts:
+        print(
+            f"Loaded SFT adapter for DPO cast LoRA dtypes: {cast_counts}",
+            flush=True,
+        )
     assert_model_bf16(loaded, "Loaded SFT adapter for DPO")
     model.validate_kv_sharing(loaded, checkpoint_weight_keys(model.BASE_MODEL, base_revision))
     adapter_parameter_names = [name for name, _ in loaded.named_parameters() if "lora_" in name]
