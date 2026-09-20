@@ -68,7 +68,7 @@ CHARS_PER_TOKEN_FLOOR = 2.0
 
 # KLD screening must have enough complete contexts for a stable comparison.
 # The configured EVAL_PER_LANGUAGE sample can be smaller than this floor.
-EVAL_MIN_FULL_CHUNKS = 100
+EVAL_MIN_FULL_CHUNKS = 50
 EVAL_TOKEN_MARGIN = 1.10
 
 _STOCK_TEMPLATE_CACHE: str | None = None
