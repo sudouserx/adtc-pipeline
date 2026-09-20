@@ -12,6 +12,9 @@ Patched 2026-09-22 (2): the strict "bulk drifted from recipe" check selected eve
 tensor containing ".ffn_", including the F32 ``ffn_norm`` scales, so it raised on
 every explicit-recipe candidate (q4_k_m_ud_style, ud_q4_k_xl). It now checks
 only blk.N.ffn_{gate,up,down}.weight.
+Patched 2026-09-22 (3): recipe.json now also records "filename" and "role"
+(06_screen.py raised KeyError: 'filename'; controls such as q8_0_ceiling can no
+longer win screening).
 
 Candidate matrix (imatrix-fixed, see 04_imatrix.py):
   - q4_k_m_default    : the MISSING CONTROL. Plain llama.cpp Q4_K_M mixture
@@ -138,6 +141,7 @@ CANDIDATES: dict[str, dict] = {
     },
     "q8_0_ceiling": {
         "base_type": "q8_0",
+        "role": "control",   # noise-floor reference; screened but never the winner
         "filename": "kuza-q8_0-ceiling.gguf",
         "pure": True,
         "use_imatrix": False,
@@ -278,6 +282,8 @@ def main() -> int:
             output.parent / "recipe.json",
             {
                 "name": name,
+                "filename": output.name,   # 06_screen.py resolves the GGUF from this
+                "role": spec.get("role", "candidate"),
                 "base_type": spec["base_type"],
                 "pure": spec.get("pure", False),
                 "use_imatrix": spec.get("use_imatrix", False),

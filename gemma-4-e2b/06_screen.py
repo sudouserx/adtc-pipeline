@@ -24,6 +24,21 @@ Changes vs the original 06_screen.py:
      defines the matrix; no model.py edits needed). This is how the
      q4_0_qat_export candidate from 03b_qat_export.py enters screening.
 
+FIXED 2026-09-22:
+  7. Discovery no longer requires ``recipe["filename"]`` (05_quants.py never
+     wrote it -> KeyError). The GGUF is resolved from the recipe when present,
+     else from the single .gguf in the candidate directory (size-matched when
+     ambiguous). Recipes are checked for staleness: size vs file, and the
+     imatrix / BF16-reference sha256 recorded by 05 vs the current artifacts.
+  8. Controls (``role == "control"`` or a ``*_ceiling`` name — the Q8_0 noise
+     floor) are screened and reported but can never win: as the lowest-KLD
+     entry they used to define the "tied band" alone and be crowned winner.
+  9. peak_rss_kb now comes from the CPU bench run (the edge memory budget),
+     not the -ngl 999 KLD run where the weights live on the GPU.
+ 10. The number of KLD chunks llama-perplexity actually ran is recorded, and a
+     warning is printed when the eval corpus is too short for
+     config.SCREEN_KLD_CHUNKS (llama-perplexity silently clamps --chunks).
+
 Requires repo-root siblings (not just this gemma-4-e2b/ directory):
   ../experiments/eval_hidden.py
   ../data/hidden_prompts.jsonl
@@ -45,6 +60,7 @@ from common import (
     gguf_inventory,
     help_has,
     hf_token,
+    imatrix_path,
     installed_packages,
     llama_cpp_binaries,
     parse_bench_tps,
@@ -66,6 +82,91 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 EVAL_HIDDEN = REPO_ROOT / "experiments" / "eval_hidden.py"
 HIDDEN_PROMPTS = REPO_ROOT / "data" / "hidden_prompts.jsonl"
 HIDDEN_RESULTS = REPO_ROOT / "experiments" / "results"
+
+# Candidates that calibrate the scale (Q8_0 noise floor) rather than compete.
+CONTROL_NAME_SUFFIXES = ("_ceiling",)
+
+
+def _is_control(name: str, recipe: dict | None) -> bool:
+    if recipe and recipe.get("role") == "control":
+        return True
+    return name.endswith(CONTROL_NAME_SUFFIXES)
+
+
+def _resolve_candidate_file(recipe_path: Path, recipe: dict) -> Path | None:
+    """Locate the GGUF a recipe.json describes (None if it is gone).
+
+    05_quants.py originally wrote no ``filename`` key, so fall back to the .gguf
+    in the candidate directory; if several are present (leftovers from an older
+    run) pick the one whose size matches the recipe.
+    """
+    folder = recipe_path.parent
+    filename = recipe.get("filename")
+    if filename:
+        path = folder / filename
+        return path if path.is_file() and path.stat().st_size > 0 else None
+    ggufs = sorted(
+        p for p in folder.glob("*.gguf")
+        if p.is_file() and p.stat().st_size > 0 and not p.name.endswith(".tmp.gguf")
+    )
+    if len(ggufs) > 1 and recipe.get("size") is not None:
+        matching = [p for p in ggufs if p.stat().st_size == int(recipe["size"])]
+        ggufs = matching or ggufs
+    if not ggufs:
+        return None
+    if len(ggufs) > 1:
+        raise RuntimeError(
+            f"{folder} holds several .gguf files {[p.name for p in ggufs]} and "
+            "recipe.json does not say which one it describes. Remove the stale "
+            "ones or re-run 05_quants.py."
+        )
+    return ggufs[0]
+
+
+def discover_candidates(
+    root: Path, reference_sha: str, imatrix_sha: str | None
+) -> tuple[dict[str, Path], dict[str, dict], dict[str, str]]:
+    """Find quantized candidates from quants/*/recipe.json (written by 05).
+
+    Returns (name -> gguf, name -> recipe, name -> reason for skipping).
+    """
+    candidates: dict[str, Path] = {}
+    recipes: dict[str, dict] = {}
+    skipped: dict[str, str] = {}
+    for recipe_path in sorted(root.glob("*/recipe.json")):
+        recipe = read_json(recipe_path)
+        name = recipe.get("name") or recipe_path.parent.name
+        path = _resolve_candidate_file(recipe_path, recipe)
+        if path is None:
+            skipped[name] = f"no .gguf found next to {recipe_path}"
+            print(f"WARNING: candidate {name} skipped — {skipped[name]}", flush=True)
+            continue
+        stale = []
+        if recipe.get("size") is not None and int(recipe["size"]) != path.stat().st_size:
+            stale.append(
+                f"file is {path.stat().st_size} bytes, recipe recorded {recipe['size']}"
+            )
+        if (
+            recipe.get("use_imatrix")
+            and imatrix_sha
+            and recipe.get("imatrix_sha256")
+            and recipe["imatrix_sha256"] != imatrix_sha
+        ):
+            stale.append("the imatrix changed after this candidate was quantized")
+        if (
+            recipe.get("source", "reference") == "reference"
+            and recipe.get("source_sha256")
+            and recipe["source_sha256"] != reference_sha
+        ):
+            stale.append("the BF16 reference changed after this candidate was quantized")
+        if stale:
+            raise RuntimeError(
+                f"Candidate {name} is stale ({'; '.join(stale)}). "
+                "Re-run 05_quants.py before screening."
+            )
+        candidates[name] = path
+        recipes[name] = recipe
+    return candidates, recipes, skipped
 
 
 def _runtime_flags() -> list[str]:
@@ -103,6 +204,11 @@ def _parse_ppl(output: str) -> float | None:
 def _parse_same_top_p(output: str) -> float | None:
     match = re.search(r"Same top p:\s*([0-9.]+)\s*±", output)
     return float(match.group(1)) if match else None
+
+
+def _parse_ppl_chunks(output: str) -> int | None:
+    match = re.search(r"calculating perplexity over (\d+) chunks", output)
+    return int(match.group(1)) if match else None
 
 
 def _probe_mtp(binaries: dict[str, Path], dest: Path) -> dict:
@@ -161,8 +267,6 @@ def _hidden_score(llama_cli: Path, gguf: Path, name: str, dest: Path) -> dict:
 
 def _measure_rss(command: list, log_path: Path) -> tuple[str, float | None]:
     """Wrap a command with GNU time to capture peak RSS in KB."""
-    import subprocess
-
     gnu_time = Path("/usr/bin/time")
     if not gnu_time.is_file():
         output = run(command, capture=True, log_path=log_path)
@@ -202,9 +306,19 @@ def _smoke_long(binary: Path, weights: Path, prompt: str, log_path: Path) -> str
 
 
 def _rank(candidates: dict[str, dict]) -> dict:
-    passing = {name: spec for name, spec in candidates.items() if not spec["gate_failures"]}
+    controls = {
+        name: {"mean_kld": spec.get("mean_kld"), "mean_kld_se": spec.get("mean_kld_se"),
+               "ppl": spec.get("ppl"), "same_top_p": spec.get("same_top_p"),
+               "size": spec.get("size"), "gate_failures": spec.get("gate_failures")}
+        for name, spec in candidates.items() if spec.get("role") == "control"
+    }
+    passing = {
+        name: spec for name, spec in candidates.items()
+        if not spec["gate_failures"] and spec.get("role") != "control"
+    }
     if not passing:
-        return {"winner": None, "rule": "all candidates failed the quality gates",
+        return {"winner": None, "controls": controls,
+                "rule": "no non-control candidate passed the quality gates",
                 "ranked": []}
     best_kld = min(spec["mean_kld"] for spec in passing.values() if spec["mean_kld"] is not None)
     ses = [
@@ -233,6 +347,7 @@ def _rank(candidates: dict[str, dict]) -> dict:
     ordered = ranked_names + outside
     return {
         "winner": ordered[0] if ordered else None,
+        "controls": controls,
         "kld_noise_tolerance": tolerance,
         "tied_group": sorted(tied),
         "ranked": [
@@ -252,7 +367,8 @@ def _rank(candidates: dict[str, dict]) -> dict:
             for name in ordered
         ],
         "rule": (
-            "gates first; among gate-passers within 2x KLD SE of the best: "
+            "controls (Q8_0 ceiling) never win; gates first; among gate-passers "
+            "within 2x KLD SE of the best: "
             "hidden_mean desc, CPU tg128 desc, size asc, peak RSS asc. "
             "Outside that band: KLD asc. CPU numbers are primary; GPU t/s "
             "and KLD are diagnostics."
@@ -271,17 +387,17 @@ def main() -> int:
     dest.mkdir(parents=True, exist_ok=True)
 
     # Discover candidates from recipes written by 05_quants.py.
-    candidates: dict[str, Path] = {}
-    for recipe_path in sorted(quants_dir().glob("*/recipe.json")):
-        recipe = read_json(recipe_path)
-        name = recipe["name"]
-        path = recipe_path.parent / recipe["filename"]
-        if path.is_file() and path.stat().st_size > 0:
-            candidates[name] = path
+    reference_sha = sha256_file(reference_path())
+    imatrix_file = imatrix_path()
+    imatrix_sha = sha256_file(imatrix_file) if imatrix_file.is_file() else None
+    candidates, recipes, skipped_candidates = discover_candidates(
+        quants_dir(), reference_sha, imatrix_sha
+    )
     if not candidates:
         raise RuntimeError("No candidates found under quants/*/recipe.json — run 05_quants.py.")
     for name, path in candidates.items():
         require_file(path, f"candidate {name} is missing.")
+    print(f"candidates: {', '.join(candidates)}", flush=True)
 
     mtp_probe = _probe_mtp(binaries, dest)
     runtime_flags = _runtime_flags()
@@ -306,6 +422,15 @@ def main() -> int:
     if not kld_base.is_file() or kld_base.stat().st_size == 0:
         raise RuntimeError("BF16 KLD reference file was not created")
     ref_ppl = _parse_ppl(reference_output)
+    kld_chunks_effective = _parse_ppl_chunks(reference_output)
+    if kld_chunks_effective is not None and kld_chunks_effective < config.SCREEN_KLD_CHUNKS:
+        print(
+            f"WARNING: KLD screening ran over {kld_chunks_effective} chunks, not the "
+            f"configured {config.SCREEN_KLD_CHUNKS} — the eval corpus "
+            f"({eval_path().name}) is too short. Raise EVAL_MIN_FULL_CHUNKS in "
+            "04_imatrix.py (and re-run 04) if you need the tighter KLD error bars.",
+            flush=True,
+        )
     if ref_ppl is not None and ref_ppl < 6.0:
         print(
             f"WARNING: BF16 reference PPL={ref_ppl:.2f} is suspiciously low; "
@@ -325,6 +450,8 @@ def main() -> int:
         "prompt_sha256": sha256_bytes(model.SYSTEM_PROMPT.encode()),
         "packages": installed_packages(),
         "screen_kld_chunks": config.SCREEN_KLD_CHUNKS,
+        "kld_chunks_effective": kld_chunks_effective,
+        "skipped_candidates": skipped_candidates,
         "gates": config.SCREEN_GATES,
         "runtime": {
             "flash_attn": config.FLASH_ATTN,
@@ -335,7 +462,7 @@ def main() -> int:
         },
         "reference": {
             "path": reference_path().name,
-            "sha256": sha256_file(reference_path()),
+            "sha256": reference_sha,
             "ppl": ref_ppl,
             "raw_log": "bf16-kld.log",
         },
@@ -381,7 +508,7 @@ def main() -> int:
         # parse_bench_tps flattens the table; pp comes first, then tg.
         cpu_pp = cpu_values[0] if len(cpu_values) >= 2 else None
         cpu_tg = cpu_values[-1] if len(cpu_values) >= 2 else (cpu_values[0] if cpu_values else None)
-        peak_rss = rss or cpu_rss
+        peak_rss = cpu_rss  # CPU bench = edge memory budget; the KLD run's RSS is a GPU-offload artifact
 
         # ---- GPU bench arm (diagnostic only; skipped if no GPU) ----
         gpu_tg = None
@@ -417,12 +544,12 @@ def main() -> int:
             }
 
         inventory = gguf_inventory(path, binaries["converter"].parent)
-        recipe_path = path.parent / "recipe.json"
         results["candidates"][name] = {
             "file": path.name,
+            "role": "control" if _is_control(name, recipes[name]) else "candidate",
             "size": path.stat().st_size,
             "sha256": sha256_file(path),
-            "recipe": read_json(recipe_path) if recipe_path.exists() else None,
+            "recipe": recipes[name],
             "mean_kld": mean_kld,
             "mean_kld_se": mean_kld_se,
             "ppl": ppl,
@@ -431,6 +558,7 @@ def main() -> int:
             "cpu_prompt_tps": cpu_pp,
             "gpu_generation_tps": gpu_tg,
             "peak_rss_kb": peak_rss,
+            "kld_run_rss_kb": rss,
             "speculative_used": bool(mtp_probe.get("speculative_args")),
             "tensor_type_counts": inventory["tensor_type_counts"],
             "smoke": prompt_results,
