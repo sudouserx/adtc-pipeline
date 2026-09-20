@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Export the merged model onto the QAT int4 (Q4_0) lattice before GGUF conversion.
 
-NEW STAGE (review 2026-09, finding F3). FIXED 2026-09-21.
+NEW STAGE (review 2026-09, finding F3). FIXED 2026-09-21 (rev 2).
 
 Why this exists
 ---------------
@@ -16,26 +16,45 @@ This stage re-applies the target lattice to the merged weights BEFORE
 conversion:
 
   1. Load ``merged_bf16/`` (produced by 03_reference.py).
-     FIX 2026-09-21: the merged checkpoint omits the KV-shared K/V weights
-     (layers 15-34); transformers materializes RANDOM tensors for them on
-     load. ``patch_kv_sharing`` is now applied here exactly like in
-     02_sft/03_reference, otherwise random weights were baked into the GGUF.
   2. Fake-quantize language-model linears + token/per-layer embeddings to
-     ggml's q4_0 lattice, replicating ``quantize_row_q4_0_ref`` EXACTLY:
-     block-32, scale d = signed_max/-8 (the value with the largest
-     magnitude, first occurrence) stored as f16, codes
-     floor(x*(1/d) + 8.5) clamped to 15, dequant q*d with q in [-8, 7].
-     FIX 2026-09-21: the previous symmetric variant (d = amax/8, half-away
-     rounding, two-sided clamp) picked the OPPOSITE clamp side and scale
-     sign, so ``llama-quantize --pure`` re-derived a different scale for
-     every block whose extreme value was positive and the "lattice-exact"
-     round trip did not hold.
+     ggml's q4_0 lattice, replicating ``quantize_row_q4_0_ref`` EXACTLY
+     (scale d = signed_max/-8 stored as f16, codes floor(x/d + 8.5) clamped
+     to 15, dequant q*d).
   3. Save HF weights (values sitting ON the lattice), sanitize tokenizer
      control-token flags (review F8), convert with ``--outtype f32``, then
      ``llama-quantize q4_0 --pure`` recovers the same scale and codes.
 
 Norms stay F32 (llama.cpp never quantizes them). Non-divisible tensors are
 skipped with a warning and recorded in the manifest.
+
+Fix history
+-----------
+rev 1 (2026-09-21):
+  * ``patch_kv_sharing`` applied to the merged load — the merged checkpoint
+    omits the KV-shared K/V weights (layers 15-34); transformers materializes
+    random ones, which must be stripped before export.
+  * ggml-exact q4_0 reference quantizer (previous symmetric variant picked
+    the opposite clamp side / scale sign, so ``--pure`` did not round-trip).
+  * ``sanitize_tokenizer`` EOG fix (<eos> id resolved from
+    added_tokens_decoder, not the non-existent ``eos_token["id"]``).
+
+rev 2 (2026-09-21) — the load-report abort:
+  merged_bf16/ is a TEXT-ONLY checkpoint: 03_reference.py drops the
+  vision/audio towers before saving. Re-instantiating the full
+  Gemma4ForConditionalGeneration architecture therefore reports every tower
+  parameter as MISSING (newly initialized). rev 1's loading-key gate treated
+  that as corruption and aborted. This stage is text-only BY DESIGN, so:
+    * modality-tower keys (vision_tower / audio_tower /
+      multi_modal_projector / ...) in the load report are EXPECTED and
+      ignored — the towers are never fake-quantized (name filters require
+      ``language_model``), never used, and dropped again before export;
+    * TEXT-stack keys remain strictly validated (only the documented
+      exemptions: tied embeddings, inv_freq, KV-shared layers 15-34);
+    * a positive completeness check verifies every text weight in
+      merged_bf16/ actually landed on the loaded model;
+    * the towers are dropped IMMEDIATELY after validation (before the
+      lattice snap), so the randomly-initialized parameters are never even
+      iterated.
 
 Run AFTER 03_reference.py. Produces reference_qat/kuza-qat-q4_0-lattice.gguf,
 which 05_quants.py includes as the ``q4_0_qat_export`` candidate as-is.
@@ -46,6 +65,7 @@ from __future__ import annotations
 import gc
 import json
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -53,7 +73,6 @@ from pathlib import Path
 import model
 from common import (
     gguf_inventory,
-    help_has,
     hf_token,
     llama_cpp_binaries,
     require_file,
@@ -74,6 +93,48 @@ LINEAR_SUFFIXES = (
     "gate_proj", "up_proj", "down_proj",
 )
 EMBED_SUFFIXES = ("embed_tokens", "per_layer_token_embd")
+
+# Modality submodules that 03_reference.py deliberately drops before saving
+# merged_bf16/. When this stage re-instantiates the full multimodal
+# architecture, transformers materializes them with random weights and lists
+# every parameter as MISSING in the load report. This export is TEXT-ONLY:
+# the towers are never quantized, never used, and dropped again below — their
+# absence from the checkpoint is EXPECTED, not an error.
+DROPPED_MODALITY_MODULES = (
+    "vision_tower",
+    "audio_tower",
+    "multi_modal_projector",
+    "vision_model",
+    "audio_model",
+    "vision_encoder",
+    "audio_encoder",
+    "mmproj",
+)
+DROPPED_MODALITY_ATTRS = (
+    "vision_tower", "audio_tower", "multi_modal_projector",
+    "vision_model", "audio_model", "vision_encoder", "audio_encoder",
+)
+_DROPPED_MODALITY_RE = re.compile(
+    r"(?:^|\.)(?:" + "|".join(DROPPED_MODALITY_MODULES) + r")\."
+)
+
+
+def _is_dropped_modality_key(key: str) -> bool:
+    return bool(_DROPPED_MODALITY_RE.search(key))
+
+
+def _modality_keys(keys: list[str]) -> list[str]:
+    return [key for key in keys if _is_dropped_modality_key(key)]
+
+
+def _text_stack_violations(keys: list[str]) -> list[str]:
+    """Loading keys that are neither expected-exempt nor dropped modality."""
+    return [
+        key
+        for key in keys
+        if not model.is_expected_loading_key(key)
+        and not _is_dropped_modality_key(key)
+    ]
 
 
 def _is_language_linear(name: str) -> bool:
@@ -119,7 +180,7 @@ def fake_quant_q4_0(tensor, name: str) -> tuple[object, dict]:
         ``llama-quantize --pure`` is stable.
 
     (Vectorized SIMD kernels may differ by one code on exact-half values;
-    the scale-derivation and clamp-side match, which is what the lattice
+    the scale derivation and clamp side match, which is what the lattice
     claim depends on.)
     """
     import torch
@@ -134,7 +195,7 @@ def fake_quant_q4_0(tensor, name: str) -> tuple[object, dict]:
     abs_blocks = blocks.abs()
     amax = abs_blocks.max(dim=1).values
     amax_idx = abs_blocks.argmax(dim=1, keepdim=True)   # first occurrence, like ggml
-    signed_max = blocks.gather(1, amax_idx).squeeze(1)  # ggml: value with largest |w|
+    signed_max = blocks.gather(1, amax_idx).squeeze(1)  # value with largest |w|
     d = signed_max / -8.0                               # f32 scale used for the codes
     d_stored = d.to(torch.float16).to(torch.float32)    # block scale is stored as f16
     id_ = torch.where(d != 0, 1.0 / d, torch.zeros_like(d))
@@ -221,6 +282,7 @@ def main() -> int:
     dest_dir = run_dir() / "reference_qat"
     dest_dir.mkdir(parents=True, exist_ok=True)
     lattice_dir = dest_dir / "merged_qat_lattice"
+    shutil.rmtree(lattice_dir, ignore_errors=True)  # idempotent re-runs
     lattice_dir.mkdir(parents=True, exist_ok=True)
 
     print("loading merged BF16 model for lattice export", flush=True)
@@ -232,7 +294,7 @@ def main() -> int:
     )
     if isinstance(result, tuple) and len(result) == 2:
         loaded, loading_info = result
-    else:
+    else:  # transformers build without loading_info support
         loaded, loading_info = result, None
 
     def _loading_keys(field: str) -> list[str]:
@@ -240,24 +302,39 @@ def main() -> int:
             return list(loading_info.get(field, []) or [])
         return list(getattr(loading_info, field, []) or [])
 
-    unexpected_missing = [
-        key for key in _loading_keys("missing_keys") if not model.is_expected_loading_key(key)
-    ]
-    unexpected_present = [
-        key for key in _loading_keys("unexpected_keys")
-        if not model.is_expected_loading_key(key)
-    ]
-    if unexpected_missing or unexpected_present:
+    # ---- loading-key gate with TEXT-ONLY semantics (rev 2) ---------------- #
+    # merged_bf16/ omits the modality towers BY DESIGN (03_reference drops
+    # them); their "MISSING" entries are expected and ignored. Anything in
+    # the TEXT stack that fails to load is still a hard error.
+    missing_modality = _modality_keys(_loading_keys("missing_keys"))
+    unexpected_modality = _modality_keys(_loading_keys("unexpected_keys"))
+    bad_missing = _text_stack_violations(_loading_keys("missing_keys"))
+    bad_unexpected = _text_stack_violations(_loading_keys("unexpected_keys"))
+    if bad_missing or bad_unexpected:
         raise RuntimeError(
-            "Unexpected loading keys for the merged model: "
-            f"missing={unexpected_missing[:20]}, unexpected={unexpected_present[:20]}"
+            "The TEXT stack did not load cleanly from the merged model "
+            f"(missing={bad_missing[:20]}, unexpected={bad_unexpected[:20]}). "
+            "Re-run 03_reference.py to rebuild merged_bf16/."
+        )
+    if missing_modality:
+        print(
+            f"text-only export: {len(missing_modality)} vision/audio parameters "
+            "absent from the merged checkpoint (03_reference.py drops the "
+            "modality towers) — ignored; the towers are dropped again below",
+            flush=True,
+        )
+    if unexpected_modality:
+        print(
+            f"text-only export: ignoring {len(unexpected_modality)} unused "
+            "modality keys reported by the loader",
+            flush=True,
         )
 
-    # FIX 2026-09-21: the merged checkpoint omits the KV-shared K/V weights
-    # (layers 15-34); transformers materializes RANDOM tensors for them on
-    # load. Strip them exactly like 02_sft/03_reference, otherwise random
-    # k_proj/v_proj/k_norm weights are fake-quantized and baked into the
-    # exported GGUF.
+    # ---- KV sharing: strip the re-materialized shared K/V modules --------- #
+    # The merged checkpoint omits the KV-shared K/V weights (layers 15-34);
+    # transformers materializes random tensors for them on load. Strip them
+    # exactly like 02_sft/03_reference so random weights can never be baked
+    # into the exported GGUF.
     kv_patch = model.patch_kv_sharing(loaded)
     merged_keys = _safetensors_keys(merged)
     shared_in_checkpoint = sorted(
@@ -270,6 +347,44 @@ def main() -> int:
         )
     model.validate_kv_sharing(loaded, merged_keys)
 
+    # ---- positive text-stack completeness check --------------------------- #
+    # Every text weight in the checkpoint must actually be present on the
+    # loaded model. (Expected-exempt keys — tied embeddings, inv_freq — and
+    # modality keys are excluded; shared-KV presence is already ruled out
+    # above, so the exemption cannot mask anything.)
+    state_keys = set(loaded.state_dict().keys())
+    absent_text = sorted(
+        key
+        for key in merged_keys
+        if key not in state_keys
+        and not model.is_expected_loading_key(key)
+        and not _is_dropped_modality_key(key)
+    )
+    if absent_text:
+        raise RuntimeError(
+            "Text-stack weights from merged_bf16/ did not land on the loaded "
+            f"model: {absent_text[:20]}"
+        )
+
+    # ---- text-only: drop the (randomly re-initialized) towers early ------- #
+    dropped: list[str] = []
+    for attr in DROPPED_MODALITY_ATTRS:
+        for obj in (loaded, getattr(loaded, "model", None)):
+            if obj is None or getattr(obj, attr, None) is None:
+                continue
+            setattr(obj, attr, None)
+            dropped.append(attr)
+    if missing_modality and not dropped:
+        raise RuntimeError(
+            "The loader reported missing modality parameters but no modality "
+            "towers were found to drop — architecture mismatch"
+        )
+    print(
+        f"text-only export: dropped modality towers {sorted(set(dropped)) or '(none present)'}",
+        flush=True,
+    )
+
+    # ---- lattice snap ------------------------------------------------------ #
     quantized = 0
     skipped: list[dict] = []
     err_max = 0.0
@@ -286,19 +401,12 @@ def main() -> int:
                 parameter.data.copy_(snapped)
                 quantized += 1
                 err_max = max(err_max, stats["max_abs_err"])
+    if quantized < 100:
+        raise RuntimeError(
+            f"Lattice snap touched only {quantized} tensors — the name filters "
+            "no longer match this architecture"
+        )
     print(f"lattice export: quantized={quantized} skipped={len(skipped)} max_err={err_max:.6f}", flush=True)
-
-    # Text-only: drop vision/audio towers exactly like 03_reference.py.
-    dropped = []
-    for attr in (
-        "vision_tower", "audio_tower", "multi_modal_projector",
-        "vision_model", "audio_model", "vision_encoder", "audio_encoder",
-    ):
-        for obj in (loaded, getattr(loaded, "model", None)):
-            if obj is None or getattr(obj, attr, None) is None:
-                continue
-            setattr(obj, attr, None)
-            dropped.append(attr)
 
     tokenizer = AutoTokenizer.from_pretrained(merged)
     tokenizer.save_pretrained(lattice_dir)
@@ -360,6 +468,9 @@ def main() -> int:
                 "exact-half values"
             ),
             "kv_sharing_patch": kv_patch,
+            "text_only": True,
+            "text_stack_verified": True,
+            "modality_params_ignored": len(missing_modality),
             "quantized_tensors": quantized,
             "max_abs_err": err_max,
             "skipped_tensors": skipped[:40],
