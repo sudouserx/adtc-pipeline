@@ -39,10 +39,12 @@ from __future__ import annotations
 import shutil
 import unsloth  # noqa: F401  — patch before transformers/trl/peft
 
+import dataclasses
 import inspect
 import json
 import os
 from collections import Counter
+from inspect import Parameter
 from pathlib import Path
 from typing import Any
 
@@ -260,19 +262,94 @@ DPO_MANIFEST_KEYS = frozenset(
 )
 
 
+def _accepts_var_keyword(parameters: Any) -> bool:
+    return any(
+        parameter.kind == Parameter.VAR_KEYWORD for parameter in parameters.values()
+    )
+
+
+def _dataclass_field_names(cls: type) -> set[str]:
+    if not dataclasses.is_dataclass(cls):
+        return set()
+    return {field.name for field in dataclasses.fields(cls)}
+
+
+def _normalize_loss_type(value: Any) -> Any:
+    if isinstance(value, list) and len(value) == 1:
+        return value[0]
+    return value
+
+
 def split_dpo_kwargs(
     raw: dict[str, Any],
-    config_params: Any,
-    trainer_params: Any,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    config_keys = set(config_params)
-    trainer_keys = set(trainer_params)
-    config_kwargs = {key: value for key, value in raw.items() if key in config_keys}
-    trainer_kwargs = {
-        key: value
-        for key, value in raw.items()
-        if key not in config_keys and key in trainer_keys
-    }
+    config_cls: type,
+    trainer_cls: type,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
+    config_params = inspect.signature(config_cls).parameters
+    trainer_params = inspect.signature(trainer_cls).parameters
+    config_keys = set(config_params) - {"self"}
+    trainer_keys = set(trainer_params) - {"self"}
+    config_field_names = _dataclass_field_names(config_cls)
+    trainer_field_names = _dataclass_field_names(trainer_cls)
+    config_var_kw = _accepts_var_keyword(config_params)
+    trainer_var_kw = _accepts_var_keyword(trainer_params)
+
+    config_kwargs: dict[str, Any] = {}
+    trainer_kwargs: dict[str, Any] = {}
+    overflow_routing: dict[str, str] = {}
+    deferred: dict[str, Any] = {}
+
+    for key, value in raw.items():
+        if key in config_keys:
+            config_kwargs[key] = value
+            if key in DPO_OVERFLOW_KEYS:
+                overflow_routing[key] = "config_named"
+        elif key in trainer_keys:
+            trainer_kwargs[key] = value
+            if key in DPO_OVERFLOW_KEYS:
+                overflow_routing[key] = "trainer_named"
+        elif key in config_field_names:
+            config_kwargs[key] = value
+            if key in DPO_OVERFLOW_KEYS:
+                overflow_routing[key] = "config_field"
+        elif key in DPO_OVERFLOW_KEYS:
+            deferred[key] = value
+
+    for key, value in deferred.items():
+        if key in config_kwargs or key in trainer_kwargs:
+            continue
+        if config_var_kw or key in config_field_names:
+            config_kwargs[key] = value
+            overflow_routing[key] = "config_kwargs"
+        elif trainer_var_kw or key in trainer_field_names:
+            trainer_kwargs[key] = value
+            overflow_routing[key] = "trainer_kwargs"
+        elif key == "loss_type" and value == "sigmoid":
+            overflow_routing[key] = "default"
+            print(
+                "dpo: loss_type='sigmoid' not exposed by installed TRL; "
+                "using TRL default sigmoid DPO loss",
+                flush=True,
+            )
+        elif key == "rpo_alpha":
+            overflow_routing[key] = "unsupported"
+            print(
+                f"dpo: warning: rpo_alpha={value!r} not supported by installed "
+                "DPOConfig/DPOTrainer; RPO term will be inactive",
+                flush=True,
+            )
+        elif key == "loss_type":
+            raise RuntimeError(
+                f"loss_type={value!r} is not supported by installed DPOConfig or "
+                f"DPOTrainer (config_var_kw={config_var_kw}, "
+                f"trainer_var_kw={trainer_var_kw})"
+            )
+        else:
+            raise RuntimeError(
+                f"DPO hyperparameter {key!r} is not supported by installed "
+                f"DPOConfig or DPOTrainer (config_var_kw={config_var_kw}, "
+                f"trainer_var_kw={trainer_var_kw})"
+            )
 
     if config_kwargs.get("bf16") is not True or config_kwargs.get("fp16") is not False:
         raise RuntimeError("DPOConfig lost the BF16 gate")
@@ -284,31 +361,106 @@ def split_dpo_kwargs(
                 "DPOConfig or DPOTrainer"
             )
 
-    if "loss_type" in raw and "loss_type" not in config_kwargs and "loss_type" not in trainer_kwargs:
-        raise RuntimeError(
-            "loss_type is not supported by installed DPOConfig or DPOTrainer"
+    config_overflow = sorted(
+        key for key, route in overflow_routing.items() if route == "config_kwargs"
+    )
+    if config_overflow:
+        routed_values = ", ".join(
+            f"{key}={config_kwargs[key]!r}" for key in config_overflow
         )
-
-    if (
-        "rpo_alpha" in raw
-        and "rpo_alpha" not in config_kwargs
-        and "rpo_alpha" not in trainer_kwargs
-    ):
         print(
-            f"dpo: warning: rpo_alpha={raw['rpo_alpha']!r} not supported by "
-            "installed DPOConfig/DPOTrainer; ignoring",
+            f"dpo: routed via DPOConfig **kwargs: {routed_values}",
+            flush=True,
+        )
+    trainer_overflow = sorted(
+        key for key, route in overflow_routing.items() if route == "trainer_kwargs"
+    )
+    if trainer_overflow:
+        routed_values = ", ".join(
+            f"{key}={trainer_kwargs[key]!r}" for key in trainer_overflow
+        )
+        print(
+            f"dpo: routed via DPOTrainer **kwargs: {routed_values}",
             flush=True,
         )
 
-    routed = sorted(key for key in DPO_OVERFLOW_KEYS if key in trainer_kwargs)
-    if routed:
-        routed_values = ", ".join(f"{key}={trainer_kwargs[key]!r}" for key in routed)
+    return config_kwargs, trainer_kwargs, overflow_routing
+
+
+def build_dpo_config(
+    config_cls: type,
+    config_kwargs: dict[str, Any],
+) -> tuple[Any, dict[str, str]]:
+    routing_updates: dict[str, str] = {}
+    try:
+        return config_cls(**config_kwargs), routing_updates
+    except TypeError as exc:
+        if "rpo_alpha" not in config_kwargs:
+            raise
+        retry_kwargs = dict(config_kwargs)
+        retry_kwargs.pop("rpo_alpha", None)
         print(
-            f"dpo: routed via DPOTrainer (not on DPOConfig): {routed_values}",
+            f"dpo: warning: DPOConfig rejected rpo_alpha ({exc}); "
+            "continuing without RPO term",
             flush=True,
         )
+        routing_updates["rpo_alpha"] = "unsupported_runtime"
+        return config_cls(**retry_kwargs), routing_updates
 
-    return config_kwargs, trainer_kwargs
+
+def verify_dpo_hparams(
+    args: Any,
+    trainer: Any,
+    intended: dict[str, Any],
+    overflow_routing: dict[str, str],
+) -> dict[str, dict[str, Any]]:
+    routing: dict[str, dict[str, Any]] = {}
+    for key in DPO_OVERFLOW_KEYS:
+        if key not in intended:
+            continue
+        intended_value = intended[key]
+        applied_via = overflow_routing.get(key, "unknown")
+        actual = getattr(args, key, None)
+        if actual is None:
+            actual = getattr(trainer, key, None)
+
+        entry: dict[str, Any] = {
+            "intended": intended_value,
+            "applied_via": applied_via,
+        }
+        if actual is not None:
+            entry["actual"] = actual
+
+        if key == "beta" and actual is not None and actual != intended_value:
+            print(
+                f"dpo: warning: beta intended {intended_value!r} but runtime has {actual!r}",
+                flush=True,
+            )
+        if key == "max_length" and actual is not None and actual != intended_value:
+            print(
+                f"dpo: warning: max_length intended {intended_value!r} but runtime has {actual!r}",
+                flush=True,
+            )
+        if key == "loss_type" and actual is not None:
+            if _normalize_loss_type(actual) != _normalize_loss_type(intended_value):
+                print(
+                    f"dpo: warning: loss_type intended {intended_value!r} but runtime has {actual!r}",
+                    flush=True,
+                )
+        if key == "rpo_alpha":
+            if actual is None and applied_via not in {"unsupported", "unsupported_runtime"}:
+                print(
+                    f"dpo: warning: rpo_alpha intended {intended_value!r} but runtime has no RPO term",
+                    flush=True,
+                )
+            elif actual is not None and actual != intended_value:
+                print(
+                    f"dpo: warning: rpo_alpha intended {intended_value!r} but runtime has {actual!r}",
+                    flush=True,
+                )
+
+        routing[key] = entry
+    return routing
 
 
 def json_load(path: Path) -> dict[str, Any]:
@@ -495,17 +647,19 @@ def main() -> int:
         "dataset_num_proc": min(8, os.cpu_count() or 1),
     }
     dpo_intended = dict(dpo_config_kwargs)
-    config_kwargs, trainer_dpo_kwargs = split_dpo_kwargs(
+    config_kwargs, trainer_dpo_kwargs, overflow_routing = split_dpo_kwargs(
         dpo_config_kwargs,
-        inspect.signature(DPOConfig).parameters,
-        inspect.signature(DPOTrainer).parameters,
+        DPOConfig,
+        DPOTrainer,
     )
+    dpo_args, runtime_routing = build_dpo_config(DPOConfig, config_kwargs)
+    overflow_routing.update(runtime_routing)
     trainer_kwargs: dict[str, Any] = {
         "model": loaded,
         "ref_model": None,  # PEFT: reference = adapter disabled
         "train_dataset": train_dataset,
         "eval_dataset": eval_dataset,
-        "args": DPOConfig(**config_kwargs),
+        "args": dpo_args,
         **trainer_dpo_kwargs,
     }
     trainer_parameters = inspect.signature(DPOTrainer).parameters
@@ -514,6 +668,7 @@ def main() -> int:
     else:
         trainer_kwargs["tokenizer"] = tokenizer
     trainer = DPOTrainer(**trainer_kwargs)
+    dpo_routing = verify_dpo_hparams(dpo_args, trainer, dpo_intended, overflow_routing)
 
     result = trainer.train()
     best = trainer.state.best_model_checkpoint
@@ -567,6 +722,7 @@ def main() -> int:
                 for key, value in dpo_intended.items()
                 if key in DPO_MANIFEST_KEYS
             },
+            "hyperparameter_routing": dpo_routing,
             "train_pairs": len(train_pairs),
             "eval_pairs": len(eval_pairs),
             "system_prompt_sha256": sha256_bytes(model.SYSTEM_PROMPT.encode()),
