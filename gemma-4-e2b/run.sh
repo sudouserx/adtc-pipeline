@@ -122,24 +122,13 @@ python 01_setup_llama_cpp.py
 
 python 02_sft.py
 
-python 02b_dpo.py  # preference alignment; trains from the frozen SFT snapshot,
-                   # then promotes the policy into adapter/ for stages 03-08
+python 02b_dpo.py
 
-python 03_reference.py
-if [ "${KUZA_SKIP_QAT_EXPORT:-}" != "1" ]; then
-  python 03b_qat_export.py
-fi
+python 03b_qat_export.py
+
 python 04_imatrix.py
 python 05_quants.py
-python 06_screen.py  # hidden-set rank; KLD diagnostic; CPU bench arm is the edge signal
+python 06_screen.py
 python 07_provenance.py
 
-if [ "${KUZA_SKIP_UPLOAD:-}" = "1" ]; then
-  echo "upload: skipped (KUZA_SKIP_UPLOAD=1)"
-else
-  if [ "${KUZA_DRY_RUN:-}" = "1" ]; then
-    python 08_upload.py --dry-run
-  else
-    python 08_upload.py
-  fi
-fi
+python 08_upload.py
