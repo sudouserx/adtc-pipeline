@@ -230,19 +230,85 @@ def render_pair(tokenizer: Any, pair: dict[str, Any]) -> tuple[str, str, str] | 
 
 
 # --------------------------------------------------------------------------- #
-# DPOConfig filtering (version tolerant, mirrors 02_sft.py's approach)
+# DPO kwargs routing (version tolerant — Unsloth may move fields to trainer)
 # --------------------------------------------------------------------------- #
 
-def filter_dpo_config(kwargs: dict[str, Any], parameters: Any) -> dict[str, Any]:
-    parameter_set = set(parameters)
-    filtered = {key: value for key, value in kwargs.items() if key in parameter_set}
-    required = ("beta", "loss_type", "max_length")
-    missing = [key for key in required if key not in filtered]
-    if missing:
-        raise RuntimeError(f"DPOConfig dropped required keys: {missing}")
-    if filtered.get("bf16") is not True or filtered.get("fp16") is not False:
+DPO_OVERFLOW_KEYS = frozenset(
+    {
+        "loss_type",
+        "rpo_alpha",
+        "beta",
+        "max_length",
+        "max_prompt_length",
+        "max_completion_length",
+        "truncation_mode",
+    }
+)
+
+DPO_MANIFEST_KEYS = frozenset(
+    {
+        "beta",
+        "loss_type",
+        "rpo_alpha",
+        "learning_rate",
+        "num_train_epochs",
+        "max_prompt_length",
+        "max_completion_length",
+        "max_length",
+        "truncation_mode",
+    }
+)
+
+
+def split_dpo_kwargs(
+    raw: dict[str, Any],
+    config_params: Any,
+    trainer_params: Any,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    config_keys = set(config_params)
+    trainer_keys = set(trainer_params)
+    config_kwargs = {key: value for key, value in raw.items() if key in config_keys}
+    trainer_kwargs = {
+        key: value
+        for key, value in raw.items()
+        if key not in config_keys and key in trainer_keys
+    }
+
+    if config_kwargs.get("bf16") is not True or config_kwargs.get("fp16") is not False:
         raise RuntimeError("DPOConfig lost the BF16 gate")
-    return filtered
+
+    for key in ("beta", "max_length"):
+        if key in raw and key not in config_kwargs and key not in trainer_kwargs:
+            raise RuntimeError(
+                f"DPO hyperparameter {key!r} is not supported by installed "
+                "DPOConfig or DPOTrainer"
+            )
+
+    if "loss_type" in raw and "loss_type" not in config_kwargs and "loss_type" not in trainer_kwargs:
+        raise RuntimeError(
+            "loss_type is not supported by installed DPOConfig or DPOTrainer"
+        )
+
+    if (
+        "rpo_alpha" in raw
+        and "rpo_alpha" not in config_kwargs
+        and "rpo_alpha" not in trainer_kwargs
+    ):
+        print(
+            f"dpo: warning: rpo_alpha={raw['rpo_alpha']!r} not supported by "
+            "installed DPOConfig/DPOTrainer; ignoring",
+            flush=True,
+        )
+
+    routed = sorted(key for key in DPO_OVERFLOW_KEYS if key in trainer_kwargs)
+    if routed:
+        routed_values = ", ".join(f"{key}={trainer_kwargs[key]!r}" for key in routed)
+        print(
+            f"dpo: routed via DPOTrainer (not on DPOConfig): {routed_values}",
+            flush=True,
+        )
+
+    return config_kwargs, trainer_kwargs
 
 
 def json_load(path: Path) -> dict[str, Any]:
@@ -428,15 +494,19 @@ def main() -> int:
         "report_to": "none",
         "dataset_num_proc": min(8, os.cpu_count() or 1),
     }
-    dpo_config_kwargs = filter_dpo_config(
-        dpo_config_kwargs, inspect.signature(DPOConfig).parameters
+    dpo_intended = dict(dpo_config_kwargs)
+    config_kwargs, trainer_dpo_kwargs = split_dpo_kwargs(
+        dpo_config_kwargs,
+        inspect.signature(DPOConfig).parameters,
+        inspect.signature(DPOTrainer).parameters,
     )
     trainer_kwargs: dict[str, Any] = {
         "model": loaded,
         "ref_model": None,  # PEFT: reference = adapter disabled
         "train_dataset": train_dataset,
         "eval_dataset": eval_dataset,
-        "args": DPOConfig(**dpo_config_kwargs),
+        "args": DPOConfig(**config_kwargs),
+        **trainer_dpo_kwargs,
     }
     trainer_parameters = inspect.signature(DPOTrainer).parameters
     if "processing_class" in trainer_parameters:
@@ -494,12 +564,8 @@ def main() -> int:
             "dataset": dataset_info,
             "hyperparameters": {
                 key: value
-                for key, value in dpo_config_kwargs.items()
-                if key in {
-                    "beta", "loss_type", "rpo_alpha", "learning_rate",
-                    "num_train_epochs", "max_prompt_length",
-                    "max_completion_length", "max_length", "truncation_mode",
-                }
+                for key, value in dpo_intended.items()
+                if key in DPO_MANIFEST_KEYS
             },
             "train_pairs": len(train_pairs),
             "eval_pairs": len(eval_pairs),
