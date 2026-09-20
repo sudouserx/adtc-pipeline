@@ -8,6 +8,10 @@ recipe.json each, which 06_screen.py discovers (no model.py edits).
 Patched 2026-09-22: validate_result compared Q4_K_M mixtures against the tensor
 type "Q4_K_M" (which never exists), so q4_k_m_default always logged a bogus
 "bulk is mostly Q4_K, not Q4_K_M" warning. It now maps Q4_K_M/S/L -> Q4_K.
+Patched 2026-09-22 (2): the strict "bulk drifted from recipe" check selected every
+tensor containing ".ffn_", including the F32 ``ffn_norm`` scales, so it raised on
+every explicit-recipe candidate (q4_k_m_ud_style, ud_q4_k_xl). It now checks
+only blk.N.ffn_{gate,up,down}.weight.
 
 Candidate matrix (imatrix-fixed, see 04_imatrix.py):
   - q4_k_m_default    : the MISSING CONTROL. Plain llama.cpp Q4_K_M mixture
@@ -57,6 +61,11 @@ from common import (
 )
 
 BULK_OVERRIDES = ("ffn_gate", "ffn_up", "ffn_down")
+# The bulk matmul weights ONLY. A bare ``".ffn_" in name`` test also matches
+# ``blk.N.ffn_norm.weight`` — a 1-D F32 RMSNorm scale that llama-quantize never
+# quantizes — which made the strict recipe check fail on every explicit-recipe
+# candidate ("bulk tensors drifted": {'blk.20.ffn_norm.weight': 'F32'}).
+_BULK_TENSOR_RE = re.compile(r"^blk\.\d+\.(?:%s)\.weight$" % "|".join(BULK_OVERRIDES))
 
 # spec keys:
 #   base_type        llama-quantize positional type
@@ -174,24 +183,26 @@ def validate_result(inventory: dict, spec: dict) -> list[str]:
     # llama-quantize mixture names (Q4_K_M/S/L) differ from the per-tensor GGUF
     # type they are built on (Q4_K); compare against the latter.
     base = re.sub(r"^(Q[2-6]_K)_[SML]$", r"\1", base)
-    ffn = {
-        name
-        for name in inventory["tensors"]
-        if name.startswith("blk.") and ".ffn_" in name
-    }
-    if ffn and spec.get("overrides"):
+    ffn = {name for name in inventory["tensors"] if _BULK_TENSOR_RE.match(name)}
+    if not ffn:
+        warnings.append(
+            "no blk.N.ffn_gate/up/down weights found — bulk type check skipped "
+            "(tensor naming changed?)"
+        )
+    elif spec.get("overrides"):
         # Explicit-recipe candidates: bulk must be exactly the requested type.
         allowed = {"Q4_0"} if base == "Q4_0" else {"Q4_K"}
-        wrong = [
+        wrong = sorted(
             name for name in ffn
             if inventory["tensors"][name] not in allowed
-        ]
+        )
         if wrong:
             raise RuntimeError(
-                f"{spec['base_type']} bulk tensors drifted from recipe: "
-                f"{dict(list(((n, inventory['tensors'][n]) for n in wrong[:5])))}"
+                f"{spec['base_type']} bulk tensors drifted from recipe "
+                f"({len(wrong)}/{len(ffn)} not in {sorted(allowed)}): "
+                f"{ {n: inventory['tensors'][n] for n in wrong[:5]} }"
             )
-    elif ffn:
+    else:
         # Default-mixture candidates (Q4_K_M/IQ4_*): bulk must be dominated by
         # the base family; upgrades (Q6_K/Q8_0) are allowed and expected.
         dominant = [name for name in ffn if inventory["tensors"][name] == base]
