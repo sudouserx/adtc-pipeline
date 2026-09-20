@@ -5,6 +5,10 @@ FINAL version (2026-09-20). Replaces 05_quants.py; pairs with config.py
 and the UNMODIFIED repo common.py / model.py — candidates are written with a
 recipe.json each, which 06_screen.py discovers (no model.py edits).
 
+Patched 2026-09-22: validate_result compared Q4_K_M mixtures against the tensor
+type "Q4_K_M" (which never exists), so q4_k_m_default always logged a bogus
+"bulk is mostly Q4_K, not Q4_K_M" warning. It now maps Q4_K_M/S/L -> Q4_K.
+
 Candidate matrix (imatrix-fixed, see 04_imatrix.py):
   - q4_k_m_default    : the MISSING CONTROL. Plain llama.cpp Q4_K_M mixture
                         (imatrix on, zero tensor-type overrides). The old
@@ -32,6 +36,7 @@ Controls:
 from __future__ import annotations
 
 import os
+import re
 import shutil
 
 import model
@@ -166,6 +171,9 @@ def validate_result(inventory: dict, spec: dict) -> list[str]:
     model.assert_text_only_gguf(inventory)
     counts = inventory["tensor_type_counts"]
     base = spec["base_type"].upper().replace(".", "_")
+    # llama-quantize mixture names (Q4_K_M/S/L) differ from the per-tensor GGUF
+    # type they are built on (Q4_K); compare against the latter.
+    base = re.sub(r"^(Q[2-6]_K)_[SML]$", r"\1", base)
     ffn = {
         name
         for name in inventory["tensors"]

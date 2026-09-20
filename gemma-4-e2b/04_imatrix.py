@@ -2,6 +2,7 @@
 """Build a bilingual imatrix and held-out eval corpus from the BF16 reference.
 
 REPLACEMENT (review 2026-09, finding F1 — Critical). FIXED 2026-09-21.
+FIXED 2026-09-22 (coverage verifier false positive): see "FIX 2026-09-22" below.
 
 What went wrong in the archived run
 -----------------------------------
@@ -33,11 +34,29 @@ What this replacement does
      selected into the KLD EVAL corpus (calibration must not overlap the
      screening corpus), and the eval corpus is truncated at EVAL_CTX (the
      context the perplexity stage actually runs at), not CALIBRATION_CTX.
+  5. FIX 2026-09-22: ``verify_imatrix_coverage`` inspected ``reader.fields``
+     (GGUF *metadata*: 3 built-in GGUF.* keys + general.type + 3 imatrix.*
+     keys = exactly 7 entries) instead of ``reader.tensors``, where
+     llama-imatrix stores the statistics as ``<weight>.in_sum2`` /
+     ``<weight>.counts`` pairs. It therefore rejected every valid imatrix
+     ("tensor_entries: 7, covers_ffn: False") AFTER a ~10 minute run. The
+     verifier now reads the tensors, cross-checks them against the BF16
+     reference's ``blk.*`` matmul weights, and validates the numbers
+     (finite, non-zero counts, chunk_count * chunk_size vs the token floor).
+  6. llama-imatrix now writes ``<name>.gguf`` (silences the "GGUF format with a
+     different suffix" warning) and the file is atomically renamed to
+     imatrix_path() only when the run succeeded, so a killed run can never
+     leave a half-calibrated ``kuza.imatrix`` behind (llama-imatrix rewrites
+     the output every 10 chunks). A stale imatrix is removed before a fresh
+     run. Set KUZA_REUSE_IMATRIX=1 to skip the ~10 min llama-imatrix step and
+     just re-verify an existing imatrix (e.g. after the verifier fix).
 """
 
 from __future__ import annotations
 
+import json
 import math
+import os
 from typing import Any
 
 import config
@@ -70,6 +89,24 @@ CHARS_PER_TOKEN_FLOOR = 2.0
 # The configured EVAL_PER_LANGUAGE sample can be smaller than this floor.
 EVAL_MIN_FULL_CHUNKS = 50
 EVAL_TOKEN_MARGIN = 1.10
+
+# --- imatrix verification (llama.cpp GGUF imatrix layout) -------------------
+# llama-imatrix stores, per weight ``blk.N.<fam>.weight``, two tensors:
+#   ``blk.N.<fam>.weight.in_sum2`` (sum of squared activations) and
+#   ``blk.N.<fam>.weight.counts``. Only ``blk.*`` matmul weights are collected
+# (token_embd / per_layer_token_embd are get_rows lookups and never appear).
+IMATRIX_SUM_SUFFIX = ".in_sum2"
+IMATRIX_COUNT_SUFFIX = ".counts"
+# Families that every dense transformer block runs through mul_mat. Missing
+# these means calibration did not exercise the model. attn_k/attn_v/attn_output
+# are reported but not gated: Gemma-4 E2B KV-shared layers never compute K/V, so
+# those legitimately have no statistics.
+REQUIRED_FAMILIES = ("ffn_down", "ffn_gate", "ffn_up", "attn_q")
+MIN_FAMILY_COVERAGE = 0.90
+# chunk_count * chunk_size vs the token floor: below WARN -> warning, below
+# HARD -> the archived "10 chunks" failure mode (2% of the floor) -> error.
+CHUNK_TOKENS_WARN_FRACTION = 0.90
+CHUNK_TOKENS_HARD_FRACTION = 0.25
 
 _STOCK_TEMPLATE_CACHE: str | None = None
 _STOCK_TEMPLATE_PROBED = False
@@ -225,34 +262,201 @@ def build_calibration(
     return stats, file
 
 
-def verify_imatrix_coverage(path, llama_root) -> dict:
-    """The imatrix is a GGUF of per-tensor moments; make sure it covers the model."""
+def _gguf_scalar(reader, key: str) -> int | None:
+    """Read a scalar GGUF metadata value across gguf-py versions."""
+    field = reader.fields.get(key)
+    if field is None:
+        return None
+    try:
+        return int(field.contents())
+    except Exception:  # noqa: BLE001 — older gguf-py has no .contents()
+        try:
+            return int(field.parts[field.data[0]][0])
+        except Exception:  # noqa: BLE001
+            return None
+
+
+def _weight_family(name: str) -> str | None:
+    """``blk.12.ffn_down.weight`` -> ``ffn_down`` (None for non-block names)."""
+    parts = name.split(".")
+    if len(parts) >= 4 and parts[0] == "blk" and parts[-1] == "weight":
+        return ".".join(parts[2:-1])
+    return None
+
+
+def verify_imatrix_coverage(
+    path,
+    llama_root,
+    reference=None,
+    min_tokens: int | None = None,
+    expected_ctx: int | None = None,
+) -> dict:
+    """Validate a llama-imatrix GGUF against the BF16 reference.
+
+    FIX 2026-09-22: the statistics are GGUF *tensors* (``<w>.in_sum2`` /
+    ``<w>.counts``), not metadata *fields*. The previous version counted
+    ``reader.fields`` (always 7 for an imatrix) and rejected every good file.
+
+    Hard errors (unambiguous corruption / wrong model): no statistics, any
+    non-finite value, a required family (ffn_*, attn_q) below
+    MIN_FAMILY_COVERAGE of the reference's weights, or a token budget far below
+    the floor. Softer conditions land in ``report["warnings"]``.
+    """
     import contextlib
     import sys
+
+    import numpy as np
 
     sys.path.insert(0, str(llama_root / "gguf-py"))
     try:
         from gguf import GGUFReader
 
         reader = GGUFReader(str(path), "r")
-        fields = list(reader.fields.keys())
-        has_ffn = any("ffn_down" in name for name in fields)
-        has_attn = any("attn_q" in name or "attn_v" in name for name in fields)
-        report = {
-            "tensor_entries": len(fields),
-            "covers_ffn": has_ffn,
-            "covers_attention": has_attn,
-        }
-        if len(fields) < 100 or not (has_ffn and has_attn):
+        sums: dict[str, Any] = {}
+        counts: dict[str, Any] = {}
+        for tensor in reader.tensors:
+            if tensor.name.endswith(IMATRIX_SUM_SUFFIX):
+                sums[tensor.name[: -len(IMATRIX_SUM_SUFFIX)]] = tensor
+            elif tensor.name.endswith(IMATRIX_COUNT_SUFFIX):
+                counts[tensor.name[: -len(IMATRIX_COUNT_SUFFIX)]] = tensor
+        if not sums:
             raise RuntimeError(
-                f"imatrix coverage looks wrong: {report} — regenerate before "
-                "quantizing (review F1)"
+                f"{path} contains no '<weight>{IMATRIX_SUM_SUFFIX}' tensors "
+                f"({len(reader.fields)} metadata fields, {len(reader.tensors)} "
+                "tensors) — not a GGUF-format imatrix, or llama-imatrix wrote "
+                "an empty one. Regenerate it."
+            )
+
+        problems: list[str] = []
+        warnings: list[str] = []
+
+        # -- numeric sanity -----------------------------------------------------
+        nonfinite: list[str] = []
+        zero_counts: list[str] = []
+        count_min = count_max = None
+        for name, tensor in sums.items():
+            if not bool(np.isfinite(tensor.data).all()):
+                nonfinite.append(name)
+            counter = counts.get(name)
+            if counter is None:
+                warnings.append(f"{name}: has in_sum2 but no counts tensor")
+                continue
+            cmin = float(np.min(counter.data))
+            cmax = float(np.max(counter.data))
+            if not (math.isfinite(cmin) and math.isfinite(cmax)):
+                nonfinite.append(name + IMATRIX_COUNT_SUFFIX)
+                continue
+            if cmin <= 0:
+                zero_counts.append(name)
+            count_min = cmin if count_min is None else min(count_min, cmin)
+            count_max = cmax if count_max is None else max(count_max, cmax)
+        if nonfinite:
+            problems.append(
+                f"{len(nonfinite)} tensors hold NaN/Inf, e.g. {nonfinite[:5]}"
+            )
+        if zero_counts:
+            warnings.append(
+                f"{len(zero_counts)} tensors saw zero activations, "
+                f"e.g. {zero_counts[:5]}"
+            )
+
+        # -- coverage vs the reference -----------------------------------------
+        expected: set[str] = set()
+        if reference is not None:
+            ref_reader = GGUFReader(str(reference), "r")
+            expected = {
+                t.name
+                for t in ref_reader.tensors
+                if t.name.startswith("blk.")
+                and t.name.endswith(".weight")
+                and len(t.shape) >= 2
+            }
+            del ref_reader
+        families: dict[str, dict[str, int]] = {}
+        for name in expected:
+            fam = _weight_family(name) or "other"
+            bucket = families.setdefault(fam, {"expected": 0, "covered": 0})
+            bucket["expected"] += 1
+            bucket["covered"] += int(name in sums)
+        for fam in REQUIRED_FAMILIES:
+            if expected:
+                bucket = families.get(fam)
+                if not bucket:
+                    continue  # this architecture has no such weight
+                ratio = bucket["covered"] / bucket["expected"]
+                if ratio < MIN_FAMILY_COVERAGE:
+                    problems.append(
+                        f"{fam}: imatrix covers {bucket['covered']}/"
+                        f"{bucket['expected']} reference weights "
+                        f"({ratio:.0%} < {MIN_FAMILY_COVERAGE:.0%})"
+                    )
+            elif not any(_weight_family(n) == fam for n in sums):
+                problems.append(f"{fam}: no imatrix statistics at all")
+        unmatched = sorted(name for name in sums if expected and name not in expected)
+        if unmatched:
+            warnings.append(
+                f"{len(unmatched)} imatrix entries do not exist in the "
+                f"reference GGUF, e.g. {unmatched[:5]} (different model?)"
+            )
+        uncovered = sorted(expected - set(sums))
+
+        # -- calibration budget recorded by llama-imatrix ---------------------
+        chunk_count = _gguf_scalar(reader, "imatrix.chunk_count")
+        chunk_size = _gguf_scalar(reader, "imatrix.chunk_size")
+        if expected_ctx and chunk_size and chunk_size != expected_ctx:
+            warnings.append(
+                f"imatrix chunk_size={chunk_size} != CALIBRATION_CTX={expected_ctx}"
+            )
+        tokens_seen = None
+        if chunk_count and chunk_size:
+            tokens_seen = chunk_count * chunk_size
+            if min_tokens:
+                if tokens_seen < CHUNK_TOKENS_HARD_FRACTION * min_tokens:
+                    problems.append(
+                        f"imatrix saw only {chunk_count} chunks x {chunk_size} = "
+                        f"{tokens_seen} tokens (floor {min_tokens}) — the "
+                        "archived under-calibration failure (review F1)"
+                    )
+                elif tokens_seen < CHUNK_TOKENS_WARN_FRACTION * min_tokens:
+                    warnings.append(
+                        f"imatrix saw {tokens_seen} tokens, below "
+                        f"{CHUNK_TOKENS_WARN_FRACTION:.0%} of the {min_tokens} floor"
+                    )
+        elif min_tokens:
+            warnings.append(
+                "imatrix has no chunk_count/chunk_size metadata; "
+                "token budget not verifiable"
+            )
+
+        report = {
+            "tensor_entries": len(sums),
+            "covers_ffn": any(
+                (_weight_family(n) or "").startswith("ffn_") for n in sums
+            ),
+            "covers_attention": any(
+                (_weight_family(n) or "").startswith("attn_") for n in sums
+            ),
+            "reference_weights": len(expected),
+            "covered_reference_weights": len(expected) - len(uncovered),
+            "family_coverage": {k: families[k] for k in sorted(families)},
+            "uncovered_sample": uncovered[:10],
+            "chunk_count": chunk_count,
+            "chunk_size": chunk_size,
+            "tokens_seen": tokens_seen,
+            "count_min": count_min,
+            "count_max": count_max,
+            "warnings": warnings,
+        }
+        if problems:
+            raise RuntimeError(
+                "imatrix coverage looks wrong: "
+                + "; ".join(problems)
+                + f" — report: {json.dumps(report, default=str)}"
             )
         return report
     finally:
         with contextlib.suppress(ValueError):
             sys.path.remove(str(llama_root / "gguf-py"))
-
 
 
 def _eval_row_key(row: dict) -> tuple[Any, Any]:
@@ -463,23 +667,80 @@ def main() -> int:
     chunks = max(1, math.ceil(calib_stats["tokens"] / config.CALIBRATION_CTX) + 8)
     if calib_stats["tokens"] / chunks < config.CALIBRATION_CTX * 0.9:
         raise RuntimeError("chunk math inconsistent with verified token count")
-    run(
-        [
-            binaries["llama-imatrix"],
-            "-m", reference_path(),
-            "-f", calibration_file,
-            "-o", dest,
-            "-ngl", "999",
-            "-c", str(config.CALIBRATION_CTX),
-            "-b", "512",
-            "--chunks", str(chunks),
-            "-t", str(getattr(config, "TOOL_THREADS", 4)),
-        ],
-        log_path=dest_dir / "imatrix.log",
-    )
+
+    # llama-imatrix rewrites its output every 10 chunks, so write to a ``.gguf``
+    # temp name (the format is GGUF; a different suffix only triggers a warning)
+    # and rename into place after the run succeeds.
+    meta_path = dest_dir / "imatrix_meta.json"
+    tmp_dest = dest.with_name(dest.name + ".tmp.gguf")
+    reused = False
+    if os.environ.get("KUZA_REUSE_IMATRIX") == "1":
+        if not dest.is_file() or dest.stat().st_size == 0:
+            raise RuntimeError(
+                "KUZA_REUSE_IMATRIX=1 but there is no existing imatrix at "
+                f"{dest}; unset it to generate one."
+            )
+        if meta_path.is_file():
+            previous = json.loads(meta_path.read_text()).get("calibration_sha256")
+            if previous and previous != calib_stats["sha256"]:
+                raise RuntimeError(
+                    "KUZA_REUSE_IMATRIX=1 but the calibration corpus changed "
+                    "since this imatrix was generated; unset it to regenerate."
+                )
+        else:
+            print(
+                "imatrix: no imatrix_meta.json (imatrix predates it); reusing "
+                "on the strength of the verification below.",
+                flush=True,
+            )
+        reused = True
+        print(f"imatrix: reusing existing {dest}", flush=True)
+    else:
+        dest.unlink(missing_ok=True)      # never leave a stale imatrix behind
+        meta_path.unlink(missing_ok=True)
+        tmp_dest.unlink(missing_ok=True)
+        run(
+            [
+                binaries["llama-imatrix"],
+                "-m", reference_path(),
+                "-f", calibration_file,
+                "-o", tmp_dest,
+                "-ngl", "999",
+                "-c", str(config.CALIBRATION_CTX),
+                "-b", "512",
+                "--chunks", str(chunks),
+                "-t", str(getattr(config, "TOOL_THREADS", 4)),
+            ],
+            log_path=dest_dir / "imatrix.log",
+        )
+        if not tmp_dest.exists() or tmp_dest.stat().st_size == 0:
+            raise RuntimeError("llama-imatrix did not produce a valid artifact")
+        os.replace(tmp_dest, dest)
     if not dest.exists() or dest.stat().st_size == 0:
         raise RuntimeError("llama-imatrix did not produce a valid artifact")
-    coverage = verify_imatrix_coverage(dest, binaries["converter"].parent)
+    coverage = verify_imatrix_coverage(
+        dest,
+        binaries["converter"].parent,
+        reference=reference_path(),
+        min_tokens=config.CALIBRATION_MIN_TOKENS,
+        expected_ctx=config.CALIBRATION_CTX,
+    )
+    for warning in coverage.get("warnings", []):
+        print(f"imatrix warning: {warning}", flush=True)
+    print(
+        f"imatrix verified: {coverage['tensor_entries']} tensors, "
+        f"{coverage['covered_reference_weights']}/{coverage['reference_weights']} "
+        f"reference block weights, {coverage['tokens_seen']} tokens",
+        flush=True,
+    )
+    write_json(
+        meta_path,
+        {
+            "calibration_sha256": calib_stats["sha256"],
+            "chunks_requested": chunks,
+            "calibration_ctx": config.CALIBRATION_CTX,
+        },
+    )
     write_json(
         dest_dir / "corpus_manifest.json",
         {
@@ -494,6 +755,7 @@ def main() -> int:
                 & {(row["source"], row["source_id"]) for row in eval_rows}
             ),
             "imatrix_chunks": chunks,
+            "imatrix_reused": reused,
             "imatrix_coverage": coverage,
             "calibration_token_floor": config.CALIBRATION_MIN_TOKENS,
             "system_prompt_max_fraction": config.CALIBRATION_SYSTEM_PROMPT_MAX_FRACTION,
