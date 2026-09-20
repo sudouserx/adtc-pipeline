@@ -66,6 +66,11 @@ MIN_ROW_TOKENS = 8
 # the BatchEncoding unwrap broke (the archived run's root cause).
 CHARS_PER_TOKEN_FLOOR = 2.0
 
+# KLD screening must have enough complete contexts for a stable comparison.
+# The configured EVAL_PER_LANGUAGE sample can be smaller than this floor.
+EVAL_MIN_FULL_CHUNKS = 100
+EVAL_TOKEN_MARGIN = 1.10
+
 _STOCK_TEMPLATE_CACHE: str | None = None
 _STOCK_TEMPLATE_PROBED = False
 
@@ -249,6 +254,124 @@ def verify_imatrix_coverage(path, llama_root) -> dict:
             sys.path.remove(str(llama_root / "gguf-py"))
 
 
+
+def _eval_row_key(row: dict) -> tuple[Any, Any]:
+    return row.get("source"), row.get("source_id")
+
+
+def _render_eval_token_count(tokenizer, row: dict) -> int:
+    """Render one held-out row exactly as the eval corpus does and count tokens."""
+    rendered = model.render_text(tokenizer, row)
+    return verify_ids(
+        tokenizer,
+        rendered,
+        model.encode_ids(tokenizer, rendered),
+        "eval",
+    )
+
+
+def _expand_eval_rows(
+    tokenizer,
+    rows: list[dict],
+    initial_rows: list[dict],
+    target_tokens: int,
+    seed: int,
+) -> tuple[list[dict], dict]:
+    """Expand a balanced held-out eval set until the verified token floor is met.
+
+    Calibration rows have already been removed by the caller, so expansion is
+    restricted to the remaining held-out pool. No training rows are introduced
+    into the KLD screening corpus.
+    """
+    from common import deterministic_sample
+
+    selected: list[dict] = []
+    selected_ids: set[tuple[Any, Any]] = set()
+
+    def add_if_new(row: dict) -> bool:
+        key = _eval_row_key(row)
+        if key in selected_ids:
+            return False
+        selected_ids.add(key)
+        selected.append(row)
+        return True
+
+    for row in initial_rows:
+        add_if_new(row)
+
+    buckets: dict[str, list[dict]] = {"english": [], "swahili": [], "other": []}
+    for row in rows:
+        key = _eval_row_key(row)
+        if key in selected_ids:
+            continue
+        language = str(row.get("language", "")).lower()
+        bucket = (
+            "english"
+            if language == "english"
+            else "swahili"
+            if language == "swahili"
+            else "other"
+        )
+        buckets[bucket].append(row)
+
+    sampled: dict[str, list[dict]] = {}
+    for offset, bucket_name in enumerate(("english", "swahili", "other")):
+        bucket = buckets[bucket_name]
+        sampled[bucket_name] = (
+            deterministic_sample(bucket, len(bucket), seed + offset + 100)
+            if bucket
+            else []
+        )
+
+    indices = {name: 0 for name in sampled}
+    token_total = 0
+    valid_rows = 0
+    skipped_rows = 0
+
+    # Count the initial selected rows using the same render/token path as eval.
+    for row in selected:
+        try:
+            token_total += _render_eval_token_count(tokenizer, row)
+            valid_rows += 1
+        except RuntimeError:
+            skipped_rows += 1
+
+    # Round-robin over language buckets so top-up remains approximately balanced.
+    while token_total < target_tokens:
+        added_any = False
+        for bucket_name in ("english", "swahili", "other"):
+            bucket = sampled[bucket_name]
+            index = indices[bucket_name]
+            if index >= len(bucket):
+                continue
+
+            row = bucket[index]
+            indices[bucket_name] += 1
+            add_if_new(row)
+            added_any = True
+
+            try:
+                token_total += _render_eval_token_count(tokenizer, row)
+                valid_rows += 1
+            except RuntimeError:
+                skipped_rows += 1
+
+            if token_total >= target_tokens:
+                break
+
+        if not added_any:
+            break
+
+    stats = {
+        "target_tokens": target_tokens,
+        "selected_rows": len(selected),
+        "valid_rows": valid_rows,
+        "skipped_rows": skipped_rows,
+        "verified_tokens": token_total,
+    }
+    return selected, stats
+
+
 def main() -> int:
     hf_token()
     require_file(adapter_dir() / "adapter_config.json", "Run 02_sft.py first.")
@@ -265,25 +388,47 @@ def main() -> int:
     calibration_rows = _select_mixcal(rows)
     calibration_ids = {(row["source"], row["source_id"]) for row in calibration_rows}
     remaining = [
-        row for row in rows if (row["source"], row["source_id"]) not in calibration_ids
+        row for row in rows
+        if (row["source"], row["source_id"]) not in calibration_ids
     ]
-    eval_rows = select_balanced(remaining, config.EVAL_PER_LANGUAGE, config.SEED + 20)
-    if not calibration_rows or not eval_rows:
-        raise RuntimeError("Insufficient balanced held-out rows for calibration/eval")
-    # FIX: the KLD screening corpus must stay disjoint from calibration rows.
-    eval_ids = {(row["source"], row["source_id"]) for row in eval_rows}
+    if not calibration_rows or not remaining:
+        raise RuntimeError("Insufficient held-out rows for calibration/eval")
 
-    # Top up from the local English pool if the held-out corpus is too small
-    # (calibration is not evaluation; training-distribution rows are fine here
-    # and exclude held-out AND eval-corpus identities).
+    tokenizer = model.load_tokenizer(adapter_dir())
+
+    # FIX F2: select enough held-out rows for at least 100 complete EVAL_CTX
+    # chunks. Start from the configured balanced set, then expand deterministically
+    # inside the remaining held-out pool until the actual rendered token count
+    # reaches the floor with a 10% safety margin.
+    initial_eval_rows = select_balanced(
+        remaining, config.EVAL_PER_LANGUAGE, config.SEED + 20
+    )
+    target_eval_tokens = math.ceil(
+        EVAL_MIN_FULL_CHUNKS * config.EVAL_CTX * EVAL_TOKEN_MARGIN
+    )
+    eval_rows, eval_selection_stats = _expand_eval_rows(
+        tokenizer,
+        remaining,
+        initial_eval_rows,
+        target_eval_tokens,
+        config.SEED + 20,
+    )
+    if not eval_rows:
+        raise RuntimeError("No held-out evaluation rows could be rendered")
+
+    # KLD screening must stay disjoint from calibration.
+    eval_ids = {_eval_row_key(row) for row in eval_rows}
+
+    # Top up calibration from the local English pool if the held-out calibration
+    # pool is too small. These rows remain excluded from the evaluation corpus.
     if len(calibration_rows) * 600 < config.CALIBRATION_MIN_TOKENS:
         extra = load_local_or_hub(
             "english", "english", "english.jsonl", {"english": "main"}
         )
         extra = [
             row for row in extra
-            if (row["source"], row["source_id"]) not in calibration_ids
-            and (row["source"], row["source_id"]) not in eval_ids
+            if _eval_row_key(row) not in calibration_ids
+            and _eval_row_key(row) not in eval_ids
         ]
         calibration_rows = calibration_rows + extra
         print(
@@ -292,7 +437,6 @@ def main() -> int:
             flush=True,
         )
 
-    tokenizer = model.load_tokenizer(adapter_dir())
     calib_stats, calibration_file = build_calibration(
         tokenizer,
         calibration_rows,
@@ -304,11 +448,16 @@ def main() -> int:
     eval_stats = render_corpus(
         tokenizer, eval_rows, evaluation, config.EVAL_CTX
     )
-    # Eval corpus token sanity as well (screening reads this file).
-    if eval_stats["tokens"] < 100 * config.EVAL_CTX:
+    # Eval corpus token sanity as well (screening reads this file). The
+    # selection stage targets a 10% margin, but the final rendered artifact is
+    # authoritative because render_corpus may skip malformed rows.
+    eval_floor = EVAL_MIN_FULL_CHUNKS * config.EVAL_CTX
+    if eval_stats["tokens"] < eval_floor:
         raise RuntimeError(
             f"Eval corpus only {eval_stats['tokens']} tokens; screening KLD "
-            "needs >= 100 full-context chunks (review F2)."
+            f"needs >= {EVAL_MIN_FULL_CHUNKS} full-context chunks "
+            f"({eval_floor} tokens). The remaining held-out pool was "
+            "insufficient after rendering/skips."
         )
 
     chunks = max(1, math.ceil(calib_stats["tokens"] / config.CALIBRATION_CTX) + 8)
@@ -336,6 +485,9 @@ def main() -> int:
         {
             "calibration": calib_stats,
             "evaluation": eval_stats,
+            "evaluation_selection": eval_selection_stats,
+            "eval_min_full_chunks": EVAL_MIN_FULL_CHUNKS,
+            "eval_token_margin": EVAL_TOKEN_MARGIN,
             "prompt_sha256": sha256_bytes(model.SYSTEM_PROMPT.encode()),
             "overlap": sorted(
                 calibration_ids
