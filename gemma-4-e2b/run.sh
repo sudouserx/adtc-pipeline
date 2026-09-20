@@ -124,6 +124,7 @@ python 02_sft.py
 
 python 02b_dpo.py
 
+python 03_reference.py
 python 03b_qat_export.py
 
 python 04_imatrix.py
