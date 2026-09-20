@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Export the merged model onto the QAT int4 (Q4_0) lattice before GGUF conversion.
 
-NEW STAGE (review 2026-09, finding F3). FIXED 2026-09-21 (rev 2).
+NEW STAGE (review 2026-09, finding F3). FIXED 2026-09-21 (rev 3).
 
 Why this exists
 ---------------
@@ -42,19 +42,23 @@ rev 2 (2026-09-21) — the load-report abort:
   merged_bf16/ is a TEXT-ONLY checkpoint: 03_reference.py drops the
   vision/audio towers before saving. Re-instantiating the full
   Gemma4ForConditionalGeneration architecture therefore reports every tower
-  parameter as MISSING (newly initialized). rev 1's loading-key gate treated
-  that as corruption and aborted. This stage is text-only BY DESIGN, so:
-    * modality-tower keys (vision_tower / audio_tower /
-      multi_modal_projector / ...) in the load report are EXPECTED and
-      ignored — the towers are never fake-quantized (name filters require
-      ``language_model``), never used, and dropped again before export;
-    * TEXT-stack keys remain strictly validated (only the documented
-      exemptions: tied embeddings, inv_freq, KV-shared layers 15-34);
-    * a positive completeness check verifies every text weight in
-      merged_bf16/ actually landed on the loaded model;
-    * the towers are dropped IMMEDIATELY after validation (before the
-      lattice snap), so the randomly-initialized parameters are never even
-      iterated.
+  parameter as MISSING (newly initialized). The loading-key gate now
+  classifies instead of rejecting: modality-tower keys are EXPECTED and
+  ignored (never quantized, never exported), TEXT-stack keys remain strictly
+  validated, and a positive completeness check verifies every text weight in
+  merged_bf16/ actually landed on the loaded model.
+
+rev 3 (2026-09-21) — the validate_kv_sharing abort:
+  ``model.SHARED_KV_STATE`` matches ``.layers.(15-34)…(k_proj|v_proj|k_norm)``
+  WITHOUT anchoring to the language model. The vision tower has 16 layers
+  (0-15), so ``vision_tower.encoder.layers.15.self_attn.k_*`` collided with
+  the shared-KV range and ``validate_kv_sharing`` flagged the (irrelevant,
+  text-only-export) tower params as "materialized but absent from the
+  checkpoint". In 02_sft/03_reference this cannot happen because their
+  checkpoints (the base repo) contain the vision weights. Fix: the modality
+  towers are now dropped BEFORE ``validate_kv_sharing``, so the state_dict
+  under validation is already text-only, matching merged_bf16/'s semantics.
+  No model.py change is required (and would be wrong for the other stages).
 
 Run AFTER 03_reference.py. Produces reference_qat/kuza-qat-q4_0-lattice.gguf,
 which 05_quants.py includes as the ``q4_0_qat_export`` candidate as-is.
@@ -98,7 +102,7 @@ EMBED_SUFFIXES = ("embed_tokens", "per_layer_token_embd")
 # merged_bf16/. When this stage re-instantiates the full multimodal
 # architecture, transformers materializes them with random weights and lists
 # every parameter as MISSING in the load report. This export is TEXT-ONLY:
-# the towers are never quantized, never used, and dropped again below — their
+# the towers are never quantized, never used, and dropped below — their
 # absence from the checkpoint is EXPECTED, not an error.
 DROPPED_MODALITY_MODULES = (
     "vision_tower",
@@ -135,6 +139,25 @@ def _text_stack_violations(keys: list[str]) -> list[str]:
         if not model.is_expected_loading_key(key)
         and not _is_dropped_modality_key(key)
     ]
+
+
+def _drop_modality_towers(loaded) -> list[str]:
+    """Set the vision/audio towers to None, removing them from state_dict().
+
+    Called BEFORE ``validate_kv_sharing`` (rev 3): the shared-KV regex in
+    model.py is not anchored to the language model, and the vision tower's
+    layer 15 collides with the language model's shared-KV range (15-34), so
+    a text-only checkpoint + intact towers false-positives as "materialized
+    KV-shared tensors absent from the checkpoint".
+    """
+    dropped: list[str] = []
+    for attr in DROPPED_MODALITY_ATTRS:
+        for obj in (loaded, getattr(loaded, "model", None)):
+            if obj is None or getattr(obj, attr, None) is None:
+                continue
+            setattr(obj, attr, None)
+            dropped.append(attr)
+    return dropped
 
 
 def _is_language_linear(name: str) -> bool:
@@ -320,7 +343,7 @@ def main() -> int:
         print(
             f"text-only export: {len(missing_modality)} vision/audio parameters "
             "absent from the merged checkpoint (03_reference.py drops the "
-            "modality towers) — ignored; the towers are dropped again below",
+            "modality towers) — expected for a text-only export",
             flush=True,
         )
     if unexpected_modality:
@@ -331,10 +354,10 @@ def main() -> int:
         )
 
     # ---- KV sharing: strip the re-materialized shared K/V modules --------- #
-    # The merged checkpoint omits the KV-shared K/V weights (layers 15-34);
-    # transformers materializes random tensors for them on load. Strip them
-    # exactly like 02_sft/03_reference so random weights can never be baked
-    # into the exported GGUF.
+    # The merged checkpoint omits the language model's KV-shared K/V weights
+    # (layers 15-34); transformers materializes random tensors for them on
+    # load. patch_kv_sharing skips the vision/audio towers itself, so it is
+    # safe to call with the towers still attached.
     kv_patch = model.patch_kv_sharing(loaded)
     merged_keys = _safetensors_keys(merged)
     shared_in_checkpoint = sorted(
@@ -345,13 +368,32 @@ def main() -> int:
             "Merged checkpoint unexpectedly contains KV-shared tensors: "
             f"{shared_in_checkpoint[:10]}"
         )
+
+    # ---- text-only: drop the towers BEFORE KV validation (rev 3) --------- #
+    # model.SHARED_KV_STATE is not anchored to the language model, and the
+    # vision tower's layer 15 collides with the language shared-KV range
+    # (15-34) — validating a text-only checkpoint against a model that still
+    # carries the towers false-positives on vision_tower...layers.15.k_*.
+    # After this drop, state_dict() is text-only and matches merged_bf16/'s
+    # semantics exactly.
+    dropped = _drop_modality_towers(loaded)
+    if missing_modality and not dropped:
+        raise RuntimeError(
+            "The loader reported missing modality parameters but no modality "
+            "towers were found to drop — architecture mismatch"
+        )
+    print(
+        f"text-only export: dropped modality towers {sorted(set(dropped)) or '(none present)'}",
+        flush=True,
+    )
+
     model.validate_kv_sharing(loaded, merged_keys)
 
     # ---- positive text-stack completeness check --------------------------- #
     # Every text weight in the checkpoint must actually be present on the
     # loaded model. (Expected-exempt keys — tied embeddings, inv_freq — and
-    # modality keys are excluded; shared-KV presence is already ruled out
-    # above, so the exemption cannot mask anything.)
+    # modality keys are excluded; shared-KV presence in the checkpoint was
+    # already ruled out above, so the exemption cannot mask anything.)
     state_keys = set(loaded.state_dict().keys())
     absent_text = sorted(
         key
@@ -365,24 +407,6 @@ def main() -> int:
             "Text-stack weights from merged_bf16/ did not land on the loaded "
             f"model: {absent_text[:20]}"
         )
-
-    # ---- text-only: drop the (randomly re-initialized) towers early ------- #
-    dropped: list[str] = []
-    for attr in DROPPED_MODALITY_ATTRS:
-        for obj in (loaded, getattr(loaded, "model", None)):
-            if obj is None or getattr(obj, attr, None) is None:
-                continue
-            setattr(obj, attr, None)
-            dropped.append(attr)
-    if missing_modality and not dropped:
-        raise RuntimeError(
-            "The loader reported missing modality parameters but no modality "
-            "towers were found to drop — architecture mismatch"
-        )
-    print(
-        f"text-only export: dropped modality towers {sorted(set(dropped)) or '(none present)'}",
-        flush=True,
-    )
 
     # ---- lattice snap ------------------------------------------------------ #
     quantized = 0
