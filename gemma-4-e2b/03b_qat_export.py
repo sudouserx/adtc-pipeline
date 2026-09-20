@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Export the merged model onto the QAT int4 (Q4_0) lattice before GGUF conversion.
 
-NEW STAGE (review 2026-09, finding F3).
+NEW STAGE (review 2026-09, finding F3). FIXED 2026-09-21.
 
 Why this exists
 ---------------
@@ -16,15 +16,23 @@ This stage re-applies the target lattice to the merged weights BEFORE
 conversion:
 
   1. Load ``merged_bf16/`` (produced by 03_reference.py).
-  2. Fake-quantize language-model linears + token/per-layer embeddings to the
-     exact Q4_0 lattice: block-32, scale d = max|w|/8 stored as f16,
-     q = roundggml(w/d) in [-8, 7], dequant w' = d*q. (ggml roundf rounds
-     half-away-from-zero; torch.round rounds half-to-even — replicated.)
-  3. Save HF weights (bf16 values sitting ON the lattice), sanitize tokenizer
-     control-token flags (review F8), convert with ``--outtype f32`` (bf16
-     values are a subset of f32, so upcast is exact), then
-     ``llama-quantize q4_0 --pure`` recovers d and q EXACTLY — the resulting
-     GGUF contains the same weights the network saw during QAT+SFT.
+     FIX 2026-09-21: the merged checkpoint omits the KV-shared K/V weights
+     (layers 15-34); transformers materializes RANDOM tensors for them on
+     load. ``patch_kv_sharing`` is now applied here exactly like in
+     02_sft/03_reference, otherwise random weights were baked into the GGUF.
+  2. Fake-quantize language-model linears + token/per-layer embeddings to
+     ggml's q4_0 lattice, replicating ``quantize_row_q4_0_ref`` EXACTLY:
+     block-32, scale d = signed_max/-8 (the value with the largest
+     magnitude, first occurrence) stored as f16, codes
+     floor(x*(1/d) + 8.5) clamped to 15, dequant q*d with q in [-8, 7].
+     FIX 2026-09-21: the previous symmetric variant (d = amax/8, half-away
+     rounding, two-sided clamp) picked the OPPOSITE clamp side and scale
+     sign, so ``llama-quantize --pure`` re-derived a different scale for
+     every block whose extreme value was positive and the "lattice-exact"
+     round trip did not hold.
+  3. Save HF weights (values sitting ON the lattice), sanitize tokenizer
+     control-token flags (review F8), convert with ``--outtype f32``, then
+     ``llama-quantize q4_0 --pure`` recovers the same scale and codes.
 
 Norms stay F32 (llama.cpp never quantizes them). Non-divisible tensors are
 skipped with a warning and recorded in the manifest.
@@ -84,32 +92,61 @@ def _is_embedding(name: str) -> bool:
     )
 
 
+def _safetensors_keys(directory: Path) -> set[str]:
+    from safetensors import safe_open
+
+    keys: set[str] = set()
+    for path in sorted(directory.glob("*.safetensors")):
+        with safe_open(path, framework="pt", device="cpu") as handle:
+            keys.update(handle.keys())
+    if not keys:
+        raise RuntimeError(f"No safetensors tensors found in {directory}")
+    return keys
+
+
 def fake_quant_q4_0(tensor, name: str) -> tuple[object, dict]:
-    """Return a lattice-snapped copy plus error stats. No in-place mutation."""
+    """Return a lattice-snapped copy plus error stats. No in-place mutation.
+
+    Replicates ggml's reference q4_0 quantizer EXACTLY
+    (quantize_row_q4_0_ref / dequantize_row_q4_0 in ggml-quants.c):
+
+      * the block scale d is derived from the *signed* value with the
+        largest magnitude (first occurrence), d = signed_max / -8 — NOT from
+        amax/8;
+      * codes are computed against the f32 scale (floor(x*(1/d) + 8.5),
+        clamped at 15) while dequantization uses the f16-stored scale —
+        ggml's own quirk, replicated so the round trip through
+        ``llama-quantize --pure`` is stable.
+
+    (Vectorized SIMD kernels may differ by one code on exact-half values;
+    the scale-derivation and clamp-side match, which is what the lattice
+    claim depends on.)
+    """
     import torch
 
     w = tensor.detach().to(torch.float32)
     stats = {"name": name, "skipped": False}
-    rows = w.numel()
     if w.shape[-1] % LATTICE_BLOCK != 0:
         stats["skipped"] = True
         stats["reason"] = f"last dim {w.shape[-1]} not divisible by {LATTICE_BLOCK}"
         return tensor, stats
     blocks = w.reshape(-1, LATTICE_BLOCK)
-    d = blocks.abs().amax(dim=1) / 8.0
-    d = d.to(torch.float16).to(torch.float32)          # q4_0 scale is f16
-    d = torch.where(d == 0, torch.ones_like(d), d)     # guard all-zero blocks
-    x = blocks / d.unsqueeze(1)
-    # ggml roundf: half away from zero (torch.round is half-to-even)
-    q = torch.sign(x) * torch.floor(torch.abs(x) + 0.5)
-    q = torch.clamp(q, LATTICE_LOW, LATTICE_HIGH)
-    deq = (q * d.unsqueeze(1)).reshape(w.shape)
+    abs_blocks = blocks.abs()
+    amax = abs_blocks.max(dim=1).values
+    amax_idx = abs_blocks.argmax(dim=1, keepdim=True)   # first occurrence, like ggml
+    signed_max = blocks.gather(1, amax_idx).squeeze(1)  # ggml: value with largest |w|
+    d = signed_max / -8.0                               # f32 scale used for the codes
+    d_stored = d.to(torch.float16).to(torch.float32)    # block scale is stored as f16
+    id_ = torch.where(d != 0, 1.0 / d, torch.zeros_like(d))
+    xi = torch.clamp(torch.floor(blocks * id_.unsqueeze(1) + 8.5), max=15.0)
+    q = xi - 8.0                                        # codes in [-8, 7]
+    deq = (q * d_stored.unsqueeze(1)).reshape(w.shape)
     err = (deq - w).abs()
     stats.update(
         {
             "max_abs_err": float(err.max()),
             "mean_abs_err": float(err.mean()),
-            "zero_scale_blocks": int((blocks.abs().amax(dim=1) == 0).sum()),
+            "zero_scale_blocks": int((amax == 0).sum()),
         }
     )
     return deq.to(tensor.dtype), stats
@@ -121,6 +158,12 @@ def sanitize_tokenizer(directory: Path) -> dict:
     llama.cpp warns on every load otherwise ("control-looking token ... will
     be overridden") — that correction is version-dependent, so we bake the
     correct declaration into the artifacts instead.
+
+    FIX 2026-09-21: the previous EOG logic read ``eos_token["id"]`` from
+    tokenizer_config.json, but that entry carries ``content`` (not ``id``),
+    so <eos> was silently dropped from generation_config.eos_token_id and
+    only <end_of_turn> survived. Ids are now resolved via
+    added_tokens_decoder content lookups.
     """
     report: dict = {"patched_tokens": [], "generation_eos": None}
     cfg_path = directory / "tokenizer_config.json"
@@ -142,16 +185,20 @@ def sanitize_tokenizer(directory: Path) -> dict:
         gen = json.loads(gen_path.read_text(encoding="utf-8"))
         tok_path = directory / "tokenizer_config.json"
         tok = json.loads(tok_path.read_text(encoding="utf-8")) if tok_path.is_file() else {}
-        # Keep the canonical stopping pair: <eos> and <end_of_turn>.
-        eos_candidates = []
-        for name in ("eos_token",):
-            token = tok.get(name)
-            if isinstance(token, dict) and token.get("id") is not None:
-                eos_candidates.append(int(token["id"]))
+        eos_token = tok.get("eos_token")
+        eos_contents = {"<eos>"}
+        if isinstance(eos_token, dict) and eos_token.get("content"):
+            eos_contents.add(str(eos_token["content"]))
+        elif isinstance(eos_token, str) and eos_token:
+            eos_contents.add(eos_token)
+        eos_candidates: list[int] = []
         end_of_turn = None
         for token_id, entry in tok.get("added_tokens_decoder", {}).items():
-            if entry.get("content") == "<end_of_turn>":
+            content = str(entry.get("content", ""))
+            if content == "<end_of_turn>":
                 end_of_turn = int(token_id)
+            if content in eos_contents:
+                eos_candidates.append(int(token_id))
         if end_of_turn is not None:
             eos_candidates.append(end_of_turn)
         if eos_candidates:
@@ -177,9 +224,52 @@ def main() -> int:
     lattice_dir.mkdir(parents=True, exist_ok=True)
 
     print("loading merged BF16 model for lattice export", flush=True)
-    loaded = AutoModelForImageTextToText.from_pretrained(
-        merged, dtype=torch.bfloat16, low_cpu_mem_usage=True
+    result = AutoModelForImageTextToText.from_pretrained(
+        merged,
+        dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+        output_loading_info=True,
     )
+    if isinstance(result, tuple) and len(result) == 2:
+        loaded, loading_info = result
+    else:
+        loaded, loading_info = result, None
+
+    def _loading_keys(field: str) -> list[str]:
+        if isinstance(loading_info, dict):
+            return list(loading_info.get(field, []) or [])
+        return list(getattr(loading_info, field, []) or [])
+
+    unexpected_missing = [
+        key for key in _loading_keys("missing_keys") if not model.is_expected_loading_key(key)
+    ]
+    unexpected_present = [
+        key for key in _loading_keys("unexpected_keys")
+        if not model.is_expected_loading_key(key)
+    ]
+    if unexpected_missing or unexpected_present:
+        raise RuntimeError(
+            "Unexpected loading keys for the merged model: "
+            f"missing={unexpected_missing[:20]}, unexpected={unexpected_present[:20]}"
+        )
+
+    # FIX 2026-09-21: the merged checkpoint omits the KV-shared K/V weights
+    # (layers 15-34); transformers materializes RANDOM tensors for them on
+    # load. Strip them exactly like 02_sft/03_reference, otherwise random
+    # k_proj/v_proj/k_norm weights are fake-quantized and baked into the
+    # exported GGUF.
+    kv_patch = model.patch_kv_sharing(loaded)
+    merged_keys = _safetensors_keys(merged)
+    shared_in_checkpoint = sorted(
+        key for key in merged_keys if model.SHARED_KV_STATE.search(key)
+    )
+    if shared_in_checkpoint:
+        raise RuntimeError(
+            "Merged checkpoint unexpectedly contains KV-shared tensors: "
+            f"{shared_in_checkpoint[:10]}"
+        )
+    model.validate_kv_sharing(loaded, merged_keys)
+
     quantized = 0
     skipped: list[dict] = []
     err_max = 0.0
@@ -263,6 +353,13 @@ def main() -> int:
             "lattice": "q4_0",
             "block": LATTICE_BLOCK,
             "code_range": [LATTICE_LOW, LATTICE_HIGH],
+            "quantizer": "ggml_q4_0_ref_replica",
+            "quantizer_note": (
+                "scale = signed_max/-8 (f16-stored), codes floor(x/d+8.5) "
+                "clamped to 15; SIMD kernels may differ by one code on "
+                "exact-half values"
+            ),
+            "kv_sharing_patch": kv_patch,
             "quantized_tensors": quantized,
             "max_abs_err": err_max,
             "skipped_tensors": skipped[:40],

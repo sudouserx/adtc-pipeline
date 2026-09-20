@@ -329,11 +329,33 @@ def render_generation_prompt(tokenizer: Any, prompt: str) -> str:
 
 
 def text_tokenizer(obj: Any) -> Any:
-    inner = getattr(obj, "tokenizer", None)
-    if inner is not None and inner is not obj:
-        return text_tokenizer(inner)
-    return obj
+    """Return the HF text tokenizer behind a tokenizer/processor/wrapper.
 
+    FIX (2026-09-21): the old recursion unwrapped one level TOO FAR for fast
+    tokenizers — ``PreTrainedTokenizerFast.tokenizer`` is the *Rust* backend
+    (``tokenizers.Tokenizer``), not an HF tokenizer, so
+    ``text_tokenizer(fast_tok)`` used to hand Rust objects to callers
+    (encode_ids / decode_ids / _termination_ids / apply_chat_template).
+    Stop at the first real ``PreTrainedTokenizerBase``; keep unwrapping
+    processors and wrappers exactly as before.
+    """
+    try:
+        from transformers import PreTrainedTokenizerBase
+    except ImportError:
+        PreTrainedTokenizerBase = None
+    current = obj
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        if PreTrainedTokenizerBase is not None and isinstance(
+            current, PreTrainedTokenizerBase
+        ):
+            return current
+        seen.add(id(current))
+        inner = getattr(current, "tokenizer", None)
+        if inner is None or inner is current:
+            break
+        current = inner
+    return current
 
 def encode_ids(obj: Any, text: str) -> list[int]:
     tokenizer = text_tokenizer(obj)

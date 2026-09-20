@@ -1,10 +1,48 @@
 #!/usr/bin/env python3
 """Stage 02b — DPO preference alignment on top of the SFT adapter.
 
-FINAL version (2026-09-20). Pairs with config.py and the UNMODIFIED
+FINAL version (2026-09-21). Pairs with config.py and the UNMODIFIED
 repo common.py / model.py — the patched helpers the earlier 02b_dpo.py
 needed (common.dpo_adapter_dir, model.DATASETS["preference"]) are replaced
 by local equivalents, so no other file changes.
+
+FIX 2026-09-21 (the crash in the error log):
+  The previous version passed a ``_DPOTextProcessingShim`` (a plain object
+  delegating via ``__getattr__``) as ``processing_class``. The
+  (Unsloth-compiled) TRL DPOTrainer validates
+  ``isinstance(processing_class, (PreTrainedTokenizerBase, ProcessorMixin))``
+  and rejected it with::
+
+      TypeError: The `processing_class` must be either a
+      `PreTrainedTokenizerBase` or a `ProcessorMixin`
+
+  A wrapper can never pass that gate (and ``__getattr__`` delegation cannot
+  provide ``__call__``). The tokenizer itself passes the gate — exactly what
+  the working SFT stage passes to SFTTrainer — so the shim is removed. The
+  concern that motivated it (VLM DPO paths that want
+  ``processing_class.tokenizer``) is handled by:
+    1. passing the plain (chat-template-patched) tokenizer AND temporarily
+       presenting the model as its text backbone (model_type patch) so TRL
+       takes the standard TEXT dataset path for the vision-architecture
+       model, and
+    2. an automatic one-shot retry with a REAL processor whose
+       ``.tokenizer`` is this tokenizer (plus an empty ``images`` column)
+       if the installed TRL build still refuses a tokenizer.
+
+Additional fixes in this version:
+  * pairs whose prompt exceeds DPO_MAX_PROMPT_LENGTH or whose completion
+    exceeds DPO_MAX_COMPLETION_LENGTH are dropped up front (counts
+    recorded), so TRL prompt truncation can never cut the
+    ``<start_of_turn>model`` generation header off a training prompt;
+  * after construction the trainer's tokenized first row is verified
+    against the rendered pair — a TRL build that prepends BOS to an
+    already-``<bos>``-prefixed prompt is detected and the duplicate BOS is
+    stripped from every train/eval row;
+  * a missing Hub validation split is carved from train instead of
+    crashing the stage;
+  * dataset rows handed to TRL carry exactly prompt/chosen/rejected;
+  * ``_dpo_tokenizer_from_processing`` no longer unwraps
+    ``PreTrainedTokenizerFast.tokenizer`` (the Rust backend) by accident.
 
 Flow:
   1. Snapshot the pristine SFT adapter:  adapter/  ->  adapter-sft/
@@ -148,9 +186,31 @@ def resolve_preference_dataset() -> tuple[list[dict[str, Any]], list[dict[str, A
             flush=True,
         )
         return None
-    train_rows = [dict(row) for row in loaded.get("train", [])]
-    eval_rows = [dict(row) for row in loaded.get(config.DPO_VALIDATION_SPLIT, [])]
-    info = {"origin": "hub", "repo": repo, "rows": len(train_rows) + len(eval_rows)}
+    if hasattr(loaded, "keys"):  # DatasetDict
+        train_rows = [dict(row) for row in loaded.get("train", [])]
+        eval_rows = [dict(row) for row in loaded.get(config.DPO_VALIDATION_SPLIT, [])]
+    else:  # single-split Dataset
+        train_rows = [dict(row) for row in loaded]
+        eval_rows = []
+    info = {
+        "origin": "hub",
+        "repo": repo,
+        "rows": len(train_rows) + len(eval_rows),
+        "validation_split": config.DPO_VALIDATION_SPLIT,
+    }
+    # FIX: a repository without a validation split used to reach build() with
+    # zero eval rows and die on the "too few usable pairs" gate. Carve a
+    # deterministic 10% hold-out from the head of train instead.
+    if not eval_rows and train_rows:
+        held = max(1, round(len(train_rows) * 0.10))
+        eval_rows = train_rows[:held]
+        train_rows = train_rows[held:]
+        info["validation_carved"] = {"held_out_rows": held, "source": "train_head"}
+        print(
+            f"dpo: hub dataset has no '{config.DPO_VALIDATION_SPLIT}' split; "
+            f"held out {held} train rows for evaluation",
+            flush=True,
+        )
     return train_rows, eval_rows, info
 
 
@@ -464,15 +524,9 @@ def verify_dpo_hparams(
     return routing
 
 
-class _DPOTextProcessingShim:
-    """Unsloth VLM DPO row expects processing_class.tokenizer even for text-only data."""
-
-    def __init__(self, tokenizer: Any) -> None:
-        self.tokenizer = tokenizer
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self.tokenizer, name)
-
+# --------------------------------------------------------------------------- #
+# processing_class resolution (FIX 2026-09-21)
+# --------------------------------------------------------------------------- #
 
 def _is_processor(obj: Any) -> bool:
     try:
@@ -511,55 +565,16 @@ def _is_vlm_model(model: Any) -> bool:
     return "gemma4" in class_name or "imagetext" in class_name
 
 
-def resolve_dpo_processing_kwarg(
-    model: Any,
-    tokenizer: Any,
-    trainer_cls: type,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    trainer_parameters = inspect.signature(trainer_cls).parameters
-    metadata = {
-        "tokenizer_class": type(tokenizer).__name__,
-        "shim_used": False,
-        "model_type": getattr(getattr(model, "config", None), "model_type", None),
-        "text_config_model_type": getattr(
-            getattr(getattr(model, "config", None), "text_config", None),
-            "model_type",
-            None,
-        ),
-        "route": "unknown",
-    }
-    if _is_processor(tokenizer):
-        metadata["route"] = "processing_class_processor"
-        if "processing_class" in trainer_parameters:
-            return {"processing_class": tokenizer}, metadata
-        if "tokenizer" in trainer_parameters:
-            return {"tokenizer": getattr(tokenizer, "tokenizer", tokenizer)}, metadata
-        raise RuntimeError("DPOTrainer accepts neither processing_class nor tokenizer")
-
-    if _is_plain_tokenizer(tokenizer) and _is_vlm_model(model):
-        metadata["shim_used"] = True
-        metadata["route"] = "processing_class_shim"
-        print(
-            "dpo: processing_class shim for VLM text-only DPO",
-            flush=True,
-        )
-        shim = _DPOTextProcessingShim(tokenizer)
-        if "processing_class" in trainer_parameters:
-            return {"processing_class": shim}, metadata
-        if "tokenizer" in trainer_parameters:
-            return {"tokenizer": tokenizer}, metadata
-        raise RuntimeError("DPOTrainer accepts neither processing_class nor tokenizer")
-
-    metadata["route"] = "processing_class_tokenizer"
-    if "processing_class" in trainer_parameters:
-        return {"processing_class": tokenizer}, metadata
-    if "tokenizer" in trainer_parameters:
-        return {"tokenizer": tokenizer}, metadata
-    raise RuntimeError("DPOTrainer accepts neither processing_class nor tokenizer")
-
-
 @contextmanager
 def _dpo_text_only_model_type(model: Any) -> Iterator[None]:
+    """Temporarily present the VLM as its text backbone during trainer init.
+
+    TRL keys its vision-specific DPO dataset path off
+    ``model.config.model_type in MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES``.
+    We train text-only pre-rendered pairs, so force the composite config's
+    model_type to the text config's value for the duration of
+    ``DPOTrainer(...)`` so the standard text tokenization path is used.
+    """
     model_config = getattr(model, "config", None)
     if model_config is None:
         yield
@@ -574,6 +589,160 @@ def _dpo_text_only_model_type(model: Any) -> Iterator[None]:
             model_config.model_type = original
         return
     yield
+
+
+def _processor_for_dpo(tokenizer: Any, base_revision: str) -> Any:
+    """A real processor whose .tokenizer is our chat-template-patched tokenizer.
+
+    Fallback for TRL builds that insist on a ProcessorMixin processing_class
+    for vision-architecture models even with text-only pairs.
+    """
+    from transformers import AutoProcessor
+
+    processor = AutoProcessor.from_pretrained(
+        model.BASE_MODEL, revision=base_revision, token=hf_token()
+    )
+    processor.tokenizer = tokenizer
+    template = getattr(tokenizer, "chat_template", None)
+    if template:
+        try:
+            processor.chat_template = template
+        except Exception:  # noqa: BLE001 — cosmetic best effort
+            pass
+    return processor
+
+
+_DPO_PROCESSING_RETRY_MARKERS = (
+    "processing_class",
+    "ProcessorMixin",
+    "PreTrainedTokenizerBase",
+    "tokenizer",
+    "images",
+)
+
+
+def _dpo_processing_retryable(exc: BaseException) -> bool:
+    if not isinstance(exc, (TypeError, AttributeError, KeyError, ValueError)):
+        return False
+    text = str(exc)
+    return any(marker in text for marker in _DPO_PROCESSING_RETRY_MARKERS)
+
+
+def construct_dpo_trainer(
+    trainer_cls: type,
+    trainer_kwargs: dict[str, Any],
+    model_obj: Any,
+    tokenizer: Any,
+    base_revision: str,
+    train_pairs: list[dict[str, str]],
+    eval_pairs: list[dict[str, str]],
+) -> tuple[Any, dict[str, Any]]:
+    """Build the DPOTrainer with a processing_class the installed TRL accepts.
+
+    FIX 2026-09-21: the previous run passed a ``_DPOTextProcessingShim`` and
+    TRL rejected it with ``TypeError: The `processing_class` must be either a
+    `PreTrainedTokenizerBase` or a `ProcessorMixin``` — a delegating wrapper
+    is an instance of neither. The tokenizer itself passes that gate.
+
+      attempt 1 — processing_class = tokenizer, with the composite config's
+                  model_type temporarily set to the text backbone so TRL
+                  takes its standard text path (pairs are pre-rendered
+                  strings; no images).
+      attempt 2 — only if attempt 1 raises a processing-class-related error:
+                  a real processor for the base model with ``.tokenizer``
+                  grafted to our patched tokenizer, no model_type patch, and
+                  an empty ``images`` column for TRL's vision dataset path.
+    """
+    metadata: dict[str, Any] = {
+        "tokenizer_class": type(tokenizer).__name__,
+        "shim_used": False,
+        "model_type": getattr(getattr(model_obj, "config", None), "model_type", None),
+        "text_config_model_type": getattr(
+            getattr(getattr(model_obj, "config", None), "text_config", None),
+            "model_type",
+            None,
+        ),
+        "is_vlm_model": _is_vlm_model(model_obj),
+    }
+    text_patch_active = bool(
+        metadata["text_config_model_type"]
+        and metadata["model_type"]
+        and metadata["model_type"] != metadata["text_config_model_type"]
+    )
+
+    # ---- attempt 1: plain tokenizer, text-route model_type ---------------- #
+    try:
+        with _dpo_text_only_model_type(model_obj):
+            trainer = trainer_cls(**{**trainer_kwargs, "processing_class": tokenizer})
+    except Exception as exc:  # noqa: BLE001 — classified below
+        if not _dpo_processing_retryable(exc):
+            raise
+        first_error = f"{type(exc).__name__}: {exc}"
+        print(
+            f"dpo: processing_class=tokenizer rejected ({first_error}); "
+            "retrying once with a real processor (VLM route)",
+            flush=True,
+        )
+    else:
+        route = {
+            **metadata,
+            "route": "processing_class_tokenizer_text_patch",
+            "model_type_patched_during_init": text_patch_active,
+        }
+        print(
+            f"dpo: processing_class=tokenizer ({type(tokenizer).__name__}); "
+            f"text route (model_type patch "
+            f"{'active' if text_patch_active else 'inactive'})",
+            flush=True,
+        )
+        return trainer, route
+
+    # ---- attempt 2: real processor, VLM route ----------------------------- #
+    try:
+        processor = _processor_for_dpo(tokenizer, base_revision)
+        from datasets import Dataset
+
+        def with_images(pairs: list[dict[str, str]]) -> Any:
+            return Dataset.from_list(
+                [
+                    {
+                        "prompt": pair["prompt"],
+                        "chosen": pair["chosen"],
+                        "rejected": pair["rejected"],
+                        "images": [],
+                    }
+                    for pair in pairs
+                ]
+            )
+
+        trainer = trainer_cls(
+            **{
+                **trainer_kwargs,
+                "train_dataset": with_images(train_pairs),
+                "eval_dataset": with_images(eval_pairs),
+                "processing_class": processor,
+            }
+        )
+    except Exception as exc:  # noqa: BLE001 — combined, re-raised with context
+        raise RuntimeError(
+            "DPOTrainer construction failed with processing_class=tokenizer "
+            f"({first_error}) and with a real processor "
+            f"({type(exc).__name__}: {exc}). Install a TRL build whose "
+            "DPOTrainer accepts a PreTrainedTokenizerBase processing_class "
+            "for text-only pairs."
+        ) from exc
+    route = {
+        **metadata,
+        "route": "processing_class_processor_vlm",
+        "model_type_patched_during_init": False,
+        "processor_class": type(processor).__name__,
+    }
+    print(
+        f"dpo: processing_class=processor ({type(processor).__name__}) with "
+        "the patched tokenizer grafted in (VLM route)",
+        flush=True,
+    )
+    return trainer, route
 
 
 def apply_dpo_warmup_steps(
@@ -595,8 +764,112 @@ def apply_dpo_warmup_steps(
 
 
 def _dpo_tokenizer_from_processing(processing_class: Any) -> Any:
+    """HF text tokenizer behind a trainer's processing_class.
+
+    FIX: ``PreTrainedTokenizerFast.tokenizer`` is the *Rust backend*, not an
+    HF tokenizer — only unwrap when the inner object is a real tokenizer
+    (i.e. the processing class is a processor or wrapper); otherwise return
+    the processing class itself.
+    """
     inner = getattr(processing_class, "tokenizer", None)
-    return inner if inner is not None else processing_class
+    if inner is not None and _is_plain_tokenizer(inner):
+        return inner
+    return processing_class
+
+
+# --------------------------------------------------------------------------- #
+# post-construction tokenization verification (double-BOS guard)
+# --------------------------------------------------------------------------- #
+
+_PROMPT_ID_COLUMNS = ("prompt_input_ids", "prompt_ids")
+
+
+def _strip_double_bos_row(
+    row: dict[str, Any], column: str, bos_token_id: int
+) -> dict[str, Any]:
+    ids = list(row[column])
+    if len(ids) >= 2 and ids[0] == bos_token_id and ids[1] == bos_token_id:
+        return {column: ids[1:]}
+    return {column: ids}
+
+
+def verify_trainer_tokenization(
+    trainer: Any,
+    tokenizer: Any,
+    train_pairs: list[dict[str, str]],
+    metadata: dict[str, Any],
+) -> None:
+    """Verify the trainer's tokenized first row matches the rendered pair.
+
+    Some TRL builds prepend ``bos_token_id`` to ``prompt_input_ids`` even
+    when the prompt text already starts with ``<bos>`` from the chat
+    template — that would train on a double-BOS prefix (train/inference
+    mismatch). Detect it and, if present, strip the duplicate leading BOS
+    from every train/eval row.
+    """
+    if not train_pairs:
+        raise RuntimeError("DPO tokenization verification requires at least one train pair")
+    dataset = getattr(trainer, "train_dataset", None)
+    if dataset is None or len(dataset) == 0:
+        raise RuntimeError("DPO tokenization verification requires a prepared train dataset")
+    row = dataset[0]
+    column = next((name for name in _PROMPT_ID_COLUMNS if name in row), None)
+    if column is None:
+        metadata["tokenization_check"] = {
+            "status": "no_prompt_ids_column",
+            "columns": sorted(str(key) for key in row),
+        }
+        print(
+            "dpo: warning: no prompt id column found; tokenization check skipped",
+            flush=True,
+        )
+        return
+    inner_tokenizer = model.text_tokenizer(tokenizer)
+    bos = getattr(inner_tokenizer, "bos_token_id", None)
+    actual = [int(value) for value in row[column]]
+    expected = model.encode_ids(inner_tokenizer, train_pairs[0]["prompt"])
+    double_bos = bos is not None and actual[:2] == [bos, bos]
+    comparison = actual[1:] if double_bos else actual
+    shared = min(len(comparison), len(expected))
+    if shared and comparison[:shared] != expected[:shared]:
+        raise RuntimeError(
+            "DPO trainer tokenization does not match the rendered prompt "
+            f"(column={column}, actual_head={actual[:10]}, "
+            f"expected_head={expected[:10]}); refusing to train on "
+            "unexpectedly tokenized pairs"
+        )
+    if not double_bos:
+        metadata["tokenization_check"] = {
+            "status": "ok",
+            "column": column,
+            "prompt_tokens": len(actual),
+        }
+        return
+    print(
+        "dpo: TRL prepended a BOS to the already-<bos>-prefixed prompt; "
+        "stripping the duplicate from every train/eval row",
+        flush=True,
+    )
+    for attribute in ("train_dataset", "eval_dataset"):
+        current = getattr(trainer, attribute, None)
+        if current is None:
+            continue
+        names = getattr(current, "column_names", None) or []
+        if column not in names:
+            continue
+        setattr(
+            trainer,
+            attribute,
+            current.map(
+                _strip_double_bos_row,
+                fn_kwargs={"column": column, "bos_token_id": int(bos)},
+            ),
+        )
+    metadata["tokenization_check"] = {
+        "status": "double_bos_repaired",
+        "column": column,
+        "prompt_tokens": len(actual) - 1,
+    }
 
 
 def smoke_check_dpo_tokenization(
@@ -719,6 +992,17 @@ def main() -> int:
         raise RuntimeError("Resumed SFT adapter produced no trainable adapter parameters")
     model.assert_no_shared_kv_lora(adapter_parameter_names)
     assert_adapter_tensors_loaded(loaded, snapshot)
+    try:
+        from peft import PeftModel
+    except ImportError:
+        PeftModel = None  # type: ignore[assignment]
+    if PeftModel is not None and not isinstance(loaded, PeftModel):
+        print(
+            "dpo: warning: the resumed model is not a PeftModel; DPOTrainer "
+            "will build a full reference copy (extra VRAM) instead of using "
+            "the adapter-disabled reference",
+            flush=True,
+        )
 
     # ---- render + gate the preference pairs ------------------------------- #
     def build(rows: list[dict[str, Any]], split: str) -> tuple[list[dict[str, str]], dict[str, Any]]:
@@ -738,6 +1022,16 @@ def main() -> int:
             chosen_ids = model.encode_ids(tokenizer, chosen_text)
             rejected_ids = model.encode_ids(tokenizer, rejected_text)
             longest = max(len(chosen_ids), len(rejected_ids))
+            # Drop over-length pairs up front instead of letting TRL truncate:
+            # truncating the prompt with truncation_mode="keep_start" cuts the
+            # tail — exactly where the <start_of_turn>model generation header
+            # lives — and truncating the completion teaches stop-less endings.
+            if len(prompt_ids) > config.DPO_MAX_PROMPT_LENGTH:
+                quality["prompt_too_long"] += 1
+                continue
+            if longest > config.DPO_MAX_COMPLETION_LENGTH:
+                quality["completion_too_long"] += 1
+                continue
             if len(prompt_ids) + longest > config.MAX_SEQ_LENGTH:
                 quality["too_long"] += 1
                 continue
@@ -761,7 +1055,11 @@ def main() -> int:
             "valid_rows": len(rendered),
             **{key: value for key, value in sorted(quality.items())},
             "invalid_fraction": (total - len(rendered)) / max(1, total),
-            "languages": dict(Counter(row["language"] for row in rows)),
+            "max_prompt_length": config.DPO_MAX_PROMPT_LENGTH,
+            "max_completion_length": config.DPO_MAX_COMPLETION_LENGTH,
+            "languages": dict(
+                Counter(str(row.get("language", "unknown")) for row in rows)
+            ),
             "archetypes": dict(
                 Counter(str(row.get("archetype", "")) for row in rows)
             ),
@@ -775,8 +1073,20 @@ def main() -> int:
 
     from datasets import Dataset
 
-    train_dataset = Dataset.from_list(train_pairs)
-    eval_dataset = Dataset.from_list(eval_pairs)
+    def pair_columns(pairs: list[dict[str, str]]) -> list[dict[str, str]]:
+        # Hand TRL exactly prompt/chosen/rejected — the extra bookkeeping
+        # columns are for our reports only and confuse some TRL collators.
+        return [
+            {
+                "prompt": pair["prompt"],
+                "chosen": pair["chosen"],
+                "rejected": pair["rejected"],
+            }
+            for pair in pairs
+        ]
+
+    train_dataset = Dataset.from_list(pair_columns(train_pairs))
+    eval_dataset = Dataset.from_list(pair_columns(eval_pairs))
 
     # ---- trainer ----------------------------------------------------------- #
     effective_batch = config.DPO_TRAIN_BATCH_SIZE * config.DPO_GRAD_ACCUMULATION
@@ -841,15 +1151,17 @@ def main() -> int:
         "args": dpo_args,
         **trainer_dpo_kwargs,
     }
-    processing_kwargs, processing_metadata = resolve_dpo_processing_kwarg(
+    trainer, processing_metadata = construct_dpo_trainer(
+        DPOTrainer,
+        trainer_kwargs,
         loaded,
         tokenizer,
-        DPOTrainer,
+        base_revision,
+        train_pairs=train_pairs,
+        eval_pairs=eval_pairs,
     )
-    trainer_kwargs.update(processing_kwargs)
-    with _dpo_text_only_model_type(loaded):
-        trainer = DPOTrainer(**trainer_kwargs)
     dpo_routing = verify_dpo_hparams(dpo_args, trainer, dpo_intended, overflow_routing)
+    verify_trainer_tokenization(trainer, tokenizer, train_pairs, processing_metadata)
     smoke_check_dpo_tokenization(trainer, train_pairs, processing_metadata)
 
     result = trainer.train()

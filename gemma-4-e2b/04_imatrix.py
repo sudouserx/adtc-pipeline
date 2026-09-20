@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build a bilingual imatrix and held-out eval corpus from the BF16 reference.
 
-REPLACEMENT (review 2026-09, finding F1 — Critical).
+REPLACEMENT (review 2026-09, finding F1 — Critical). FIXED 2026-09-21.
 
 What went wrong in the archived run
 -----------------------------------
@@ -15,21 +15,30 @@ inherited a high-variance, system-prompt-biased importance matrix.
 
 What this replacement does
 --------------------------
-  1. HARDENED token accounting: per-row sanity bounds (tokens >= 8; tokens*2
-     <= chars + 64) raise immediately on unwrap bugs, and a final cross-check
-     enforces config.CALIBRATION_MIN_TOKENS (default 512K) — a 10-chunk
-     imatrix can never be produced silently again.
+  1. HARDENED token accounting: structural checks raise immediately on
+     unwrap bugs; legitimately short rows are SKIPPED (counted) rather than
+     crashing the stage; a final cross-check enforces
+     config.CALIBRATION_MIN_TOKENS (default 512K) — a 10-chunk imatrix can
+     never be produced silently again.
   2. Corpus composition: 75% of chunks are raw user/model turns rendered
-     WITHOUT the fixed system prompt; 25% are full chat renders. The archived
-     corpus repeated a ~150-token system prompt in 100% of rows, biasing the
-     importance matrix toward one constant string.
+     WITHOUT the fixed system prompt; 25% are full chat renders. FIX
+     2026-09-21: the Kuza-patched chat template INJECTS the system prompt
+     whenever the first turn is not a system turn, so raw renders used to
+     fail 100% of the time and the stage died with "No calibration rows
+     could be rendered". Raw renders now temporarily swap in the STOCK
+     gemma-4 template (no injection).
   3. Chunks are derived from the VERIFIED token count with a safety margin,
      and the produced imatrix is verified for tensor coverage before handoff.
+  4. FIX: the English top-up for small held-out pools now also excludes rows
+     selected into the KLD EVAL corpus (calibration must not overlap the
+     screening corpus), and the eval corpus is truncated at EVAL_CTX (the
+     context the perplexity stage actually runs at), not CALIBRATION_CTX.
 """
 
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import config
 import model
@@ -57,15 +66,58 @@ MIN_ROW_TOKENS = 8
 # the BatchEncoding unwrap broke (the archived run's root cause).
 CHARS_PER_TOKEN_FLOOR = 2.0
 
+_STOCK_TEMPLATE_CACHE: str | None = None
+_STOCK_TEMPLATE_PROBED = False
+
+
+def _stock_gemma4_template(tokenizer: Any) -> str:
+    """The stock gemma-4 chat template (no Kuza system-prompt injection).
+
+    FIX 2026-09-21: the Kuza-patched template injects the canonical system
+    prompt whenever the first turn is not a system turn, which makes
+    system-free renders impossible through it. Probe unsloth for the stock
+    template (on a COPY so the working tokenizer is never mutated).
+    """
+    global _STOCK_TEMPLATE_CACHE, _STOCK_TEMPLATE_PROBED
+    if not _STOCK_TEMPLATE_PROBED:
+        _STOCK_TEMPLATE_PROBED = True
+        try:
+            import copy as _copy
+
+            from unsloth.chat_templates import get_chat_template
+
+            probe = _copy.copy(model.text_tokenizer(tokenizer))
+            wrapped = get_chat_template(probe, chat_template=model.CHAT_TEMPLATE_NAME)
+            template = getattr(wrapped, "chat_template", None)
+            if not template:
+                inner = model.text_tokenizer(wrapped)
+                template = getattr(inner, "chat_template", None)
+            if isinstance(template, str) and template:
+                _STOCK_TEMPLATE_CACHE = template
+        except Exception as exc:  # noqa: BLE001 — surfaced below
+            print(
+                f"imatrix: could not obtain the stock "
+                f"{model.CHAT_TEMPLATE_NAME} template ({exc!r})",
+                flush=True,
+            )
+    if _STOCK_TEMPLATE_CACHE is None:
+        raise RuntimeError(
+            "The stock gemma-4 chat template is unavailable, so raw "
+            "(system-free) calibration chunks cannot be rendered. Ensure "
+            "unsloth is importable in this environment, then re-run."
+        )
+    return _STOCK_TEMPLATE_CACHE
+
 
 def verify_ids(tokenizer, text: str, ids: list, where: str) -> int:
+    """Structural sanity on encode_ids output (review F1) — raises on breakage.
+
+    Length handling is the CALLER's job: legitimately tiny rows are skipped,
+    not treated as accounting bugs (the old MIN_ROW_TOKENS raise here used to
+    kill the whole stage on one short row).
+    """
     if not isinstance(ids, list) or (ids and isinstance(ids[0], list)):
         raise RuntimeError(f"{where}: encode_ids did not unwrap to a flat id list")
-    if len(ids) < MIN_ROW_TOKENS:
-        raise RuntimeError(
-            f"{where}: encoded length {len(ids)} < {MIN_ROW_TOKENS} for a "
-            f"{len(text)}-char row; token accounting is broken (review F1)"
-        )
     if len(ids) * CHARS_PER_TOKEN_FLOOR > len(text) + 64:
         raise RuntimeError(
             f"{where}: {len(ids)} tokens for {len(text)} chars exceeds the "
@@ -76,13 +128,25 @@ def verify_ids(tokenizer, text: str, ids: list, where: str) -> int:
 
 
 def render_raw(tokenizer, row: dict) -> str:
-    """Chat-style user/model turns WITHOUT the fixed system prompt."""
+    """Chat-style user/model turns WITHOUT the fixed system prompt.
+
+    FIX 2026-09-21: temporarily swap the Kuza-patched template for the stock
+    gemma-4 template — the patched one injects the system prompt into any
+    system-less dialog, which used to fail every raw render.
+    """
     dialog = model.dialog_messages(row)
     if not dialog:
         raise RuntimeError("Row has no alternating user/model turns")
-    rendered = model._apply_chat_template(
-        tokenizer, dialog, tokenize=False, add_generation_prompt=False
-    )
+    inner = model.text_tokenizer(tokenizer)
+    patched = getattr(inner, "chat_template", None)
+    inner.chat_template = _stock_gemma4_template(tokenizer)
+    try:
+        rendered = model._apply_chat_template(
+            inner, dialog, tokenize=False, add_generation_prompt=False
+        )
+    finally:
+        if patched is not None:
+            inner.chat_template = patched
     if model.SYSTEM_PROMPT in rendered:
         raise RuntimeError("Raw render leaked the system prompt")
     return rendered
@@ -92,8 +156,6 @@ def build_calibration(
     tokenizer, rows: list[dict], dest_dir, system_prompt_fraction: float
 ) -> tuple[dict, dict]:
     """Interleave raw (75%) and chat (25%) renders until the token floor is met."""
-    import random
-
     raw_rows = []
     chat_rows = []
     skipped = 0
@@ -110,6 +172,7 @@ def build_calibration(
     target = config.CALIBRATION_MIN_TOKENS
     total = 0
     texts: list[str] = []
+    short_rows = 0
     raw_index = 0
     chat_index = 0
     # Interleave 1 chat per (1/chat_share - 1) raw rows so ANY prefix of the
@@ -121,13 +184,21 @@ def build_calibration(
                 break
             text = raw_rows[raw_index]
             raw_index += 1
+            count = verify_ids(tokenizer, text, model.encode_ids(tokenizer, text), "raw")
+            if count < MIN_ROW_TOKENS:
+                short_rows += 1
+                continue
             texts.append(text)
-            total += verify_ids(tokenizer, text, model.encode_ids(tokenizer, text), "raw")
+            total += count
         if chat_index < len(chat_rows):
             text = chat_rows[chat_index]
             chat_index += 1
+            count = verify_ids(tokenizer, text, model.encode_ids(tokenizer, text), "chat")
+            if count < MIN_ROW_TOKENS:
+                short_rows += 1
+                continue
             texts.append(text)
-            total += verify_ids(tokenizer, text, model.encode_ids(tokenizer, text), "chat")
+            total += count
 
     if total < target:
         raise RuntimeError(
@@ -138,7 +209,7 @@ def build_calibration(
         )
 
     stats = {"rows_rendered": len(texts), "raw": raw_index, "chat": chat_index,
-             "skipped_rows": skipped, "tokens": total}
+             "skipped_rows": skipped, "short_rows": short_rows, "tokens": total}
     file = dest_dir / "calibration.txt"
     file.parent.mkdir(parents=True, exist_ok=True)
     file.write_text("\n\n".join(texts) + "\n", encoding="utf-8")
@@ -199,10 +270,12 @@ def main() -> int:
     eval_rows = select_balanced(remaining, config.EVAL_PER_LANGUAGE, config.SEED + 20)
     if not calibration_rows or not eval_rows:
         raise RuntimeError("Insufficient balanced held-out rows for calibration/eval")
+    # FIX: the KLD screening corpus must stay disjoint from calibration rows.
+    eval_ids = {(row["source"], row["source_id"]) for row in eval_rows}
 
     # Top up from the local English pool if the held-out corpus is too small
     # (calibration is not evaluation; training-distribution rows are fine here
-    # and exclude held-out identities).
+    # and exclude held-out AND eval-corpus identities).
     if len(calibration_rows) * 600 < config.CALIBRATION_MIN_TOKENS:
         extra = load_local_or_hub(
             "english", "english", "english.jsonl", {"english": "main"}
@@ -210,6 +283,7 @@ def main() -> int:
         extra = [
             row for row in extra
             if (row["source"], row["source_id"]) not in calibration_ids
+            and (row["source"], row["source_id"]) not in eval_ids
         ]
         calibration_rows = calibration_rows + extra
         print(
@@ -225,8 +299,10 @@ def main() -> int:
         dest_dir,
         config.CALIBRATION_SYSTEM_PROMPT_MAX_FRACTION,
     )
+    # FIX: truncate the eval corpus at EVAL_CTX — the context the perplexity
+    # stage actually runs at — not CALIBRATION_CTX.
     eval_stats = render_corpus(
-        tokenizer, eval_rows, evaluation, config.CALIBRATION_CTX
+        tokenizer, eval_rows, evaluation, config.EVAL_CTX
     )
     # Eval corpus token sanity as well (screening reads this file).
     if eval_stats["tokens"] < 100 * config.EVAL_CTX:
